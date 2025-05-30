@@ -13,16 +13,9 @@ if ! command -v kubectl &> /dev/null; then
     brew install kubectl
 fi
 
-# Define variables
+# Define cluster name
 CLUSTER_NAME="featherman-e2e"
-REGISTRY_NAME="kind-registry"
-REGISTRY_PORT="5001"
-
-# Create registry container unless it already exists
-if ! docker ps --filter name=^/${REGISTRY_NAME}$ --format '{{.Names}}' | grep -q "^${REGISTRY_NAME}$"; then
-    echo "Creating local registry container..."
-    docker run -d --restart=always -p "${REGISTRY_PORT}:5000" --name "${REGISTRY_NAME}" registry:2
-fi
+CONTROLLER_IMG="featherman-controller:latest"
 
 # Delete existing cluster if it exists
 if kind get clusters | grep -q "^${CLUSTER_NAME}$"; then
@@ -30,14 +23,10 @@ if kind get clusters | grep -q "^${CLUSTER_NAME}$"; then
     kind delete cluster --name "${CLUSTER_NAME}"
 fi
 
-# Create KinD cluster config with registry config
+# Create KinD cluster config
 cat <<EOF > kind-config.yaml
 kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4
-containerdConfigPatches:
-- |-
-  [plugins."io.containerd.grpc.v1.cri".registry.mirrors."localhost:${REGISTRY_PORT}"]
-    endpoint = ["http://${REGISTRY_NAME}:5000"]
 nodes:
 - role: control-plane
   extraPortMappings:
@@ -50,12 +39,6 @@ EOF
 # Create cluster
 echo "Creating KinD cluster..."
 kind create cluster --name "${CLUSTER_NAME}" --config kind-config.yaml
-
-# Connect the registry to the cluster network if not already connected
-if ! docker network inspect kind | grep -q "${REGISTRY_NAME}"; then
-    echo "Connecting registry to cluster network..."
-    docker network connect "kind" "${REGISTRY_NAME}"
-fi
 
 # Wait for cluster to be ready
 echo "Waiting for cluster to be ready..."
@@ -164,9 +147,8 @@ make install
 
 # Build and load the controller image
 echo "Building and loading controller image..."
-CONTROLLER_IMG="localhost:${REGISTRY_PORT}/featherman-controller:latest"
 make docker-build IMG="${CONTROLLER_IMG}"
-docker push "${CONTROLLER_IMG}"
+kind load docker-image "${CONTROLLER_IMG}" --name "${CLUSTER_NAME}"
 
 # Deploy the controller
 echo "Deploying controller..."
