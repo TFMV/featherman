@@ -4,95 +4,72 @@ kind: ClusterRole
 metadata:
   name: manager-role
 rules:
-  - apiGroups:
-      - ""
-    resources:
-      - configmaps
-    verbs:
-      - get
-      - list
-      - watch
-  - apiGroups:
-      - ""
-    resources:
-      - events
-    verbs:
-      - create
-      - patch
-  - apiGroups:
-      - ""
-    resources:
-      - persistentvolumeclaims
-    verbs:
-      - create
-      - delete
-      - get
-      - list
-      - patch
-      - update
-      - watch
-  - apiGroups:
-      - batch
-    resources:
-      - jobs
-      - cronjobs
-    verbs:
-      - create
-      - delete
-      - get
-      - list
-      - patch
-      - update
-      - watch
-  - apiGroups:
-      - ducklake.featherman.dev
-    resources:
-      - ducklakecatalogs
-    verbs:
-      - create
-      - delete
-      - get
-      - list
-      - patch
-      - update
-      - watch
-  - apiGroups:
-      - ducklake.featherman.dev
-    resources:
-      - ducklakecatalogs/finalizers
-    verbs:
-      - update
-  - apiGroups:
-      - ducklake.featherman.dev
-    resources:
-      - ducklakecatalogs/status
-    verbs:
-      - get
-      - patch
-      - update
-  - apiGroups:
-      - ducklake.featherman.dev
-    resources:
-      - ducklaketables
-    verbs:
-      - create
-      - delete
-      - get
-      - list
-      - patch
-      - update
-      - watch
-  - apiGroups:
-      - ducklake.featherman.dev
-    resources:
-      - ducklaketables/finalizers
-    verbs:
-      - update
-  - apiGroups:
-      - ducklake.featherman.dev
-    resources:
-      - ducklaketables/status
-    verbs:
-      - get
-      - patch
-      - update
+- apiGroups:
+  - ""
+  resources:
+  - events
+  verbs:
+  - create
+  - patch
+- apiGroups:
+  - ""
+  resources:
+  - persistentvolumeclaims
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - ""
+  resources:
+  - secrets
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - batch
+  resources:
+  - cronjobs
+  - jobs
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - ducklake.featherman.dev
+  resources:
+  - ducklakecatalogs
+  - ducklaketables
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - ducklake.featherman.dev
+  resources:
+  - ducklakecatalogs/finalizers
+  - ducklaketables/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - ducklake.featherman.dev
+  resources:
+  - ducklakecatalogs/status
+  - ducklaketables/status
+  verbs:
+  - get
+  - patch
+  - update

@@ -27,7 +27,7 @@ import (
 type ObjectStoreSpec struct {
 	// Endpoint is the S3-compatible endpoint URL
 	// +kubebuilder:validation:Required
-	// +kubebuilder:validation:Pattern=^https?://.*
+	// +kubebuilder:validation:Pattern=`^https?:\/\/.*`
 	Endpoint string `json:"endpoint"`
 
 	// Bucket is the name of the S3 bucket to use
@@ -71,7 +71,7 @@ type EncryptionSpec struct {
 type BackupPolicySpec struct {
 	// Schedule is the cron expression for backups
 	// +kubebuilder:validation:Required
-	// +kubebuilder:validation:Pattern=^(@(annually|yearly|monthly|weekly|daily|hourly|reboot))|(@every (\d+(ns|us|µs|ms|s|m|h))+)|((((\d+,)+\d+|(\d+(\/|-)\d+)|\d+|\*) ?){5,7})$
+	// +kubebuilder:validation:Pattern=`^(@(annually|yearly|monthly|weekly|daily|hourly|reboot))|(@every (\d+(ns|us|µs|ms|s|m|h))+)|((((\d+,)+\d+|(\d+(\/|-)\d+)|\d+|\*) ?){5,7})$`
 	Schedule string `json:"schedule"`
 
 	// RetentionDays is the number of days to retain backups
