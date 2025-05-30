@@ -1,9 +1,78 @@
+---
+# Example 1: Table using catalog's object store configuration
 apiVersion: ducklake.featherman.dev/v1alpha1
 kind: DuckLakeTable
 metadata:
   labels:
     app.kubernetes.io/name: featherman
     app.kubernetes.io/managed-by: kustomize
-  name: ducklaketable-sample
+  name: users-table
 spec:
-  # TODO(user): Add fields here
+  name: users
+  catalogRef: ducklakecatalog-sample
+  columns:
+    - name: id
+      type: INTEGER
+      nullable: false
+    - name: username
+      type: VARCHAR
+      nullable: false
+    - name: email
+      type: VARCHAR
+      nullable: false
+    - name: created_at
+      type: TIMESTAMP
+      nullable: false
+  format:
+    compression: ZSTD
+    partitioning:
+      - created_at
+  location: users
+  mode: append
+  ttlDays: 90
+  comment: "User account information"
+---
+# Example 2: Table with its own object store configuration
+apiVersion: ducklake.featherman.dev/v1alpha1
+kind: DuckLakeTable
+metadata:
+  labels:
+    app.kubernetes.io/name: featherman
+    app.kubernetes.io/managed-by: kustomize
+  name: events-table
+spec:
+  name: events
+  catalogRef: ducklakecatalog-sample
+  columns:
+    - name: event_id
+      type: UUID
+      nullable: false
+    - name: user_id
+      type: INTEGER
+      nullable: false
+    - name: event_type
+      type: VARCHAR
+      nullable: false
+    - name: event_data
+      type: JSON
+      nullable: true
+    - name: timestamp
+      type: TIMESTAMP
+      nullable: false
+  format:
+    compression: SNAPPY
+    partitioning:
+      - timestamp
+      - event_type
+  location: events
+  mode: append
+  ttlDays: 30
+  comment: "User event tracking data"
+  objectStore:
+    endpoint: https://s3.events.example.com
+    bucket: ducklake-events
+    region: us-west-2
+    credentialsSecret:
+      name: s3-events-credentials
+      accessKeyField: access-key
+      secretKeyField: secret-key
