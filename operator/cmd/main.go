@@ -17,14 +17,22 @@ limitations under the License.
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"flag"
 	"os"
 	"path/filepath"
 
+	ducklakev1alpha1 "github.com/TFMV/featherman/operator/api/v1alpha1"
+	"github.com/TFMV/featherman/operator/internal/controller"
+	"github.com/TFMV/featherman/operator/internal/duckdb"
+	"github.com/TFMV/featherman/operator/internal/health"
+	"github.com/TFMV/featherman/operator/internal/sql"
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 	// to ensure that exec-entrypoint and run can make use of them.
-
 	"k8s.io/client-go/kubernetes"
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 
@@ -33,17 +41,10 @@ import (
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/certwatcher"
-	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	"sigs.k8s.io/controller-runtime/pkg/metrics/filters"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
-
-	ducklakev1alpha1 "github.com/TFMV/featherman/operator/api/v1alpha1"
-	"github.com/TFMV/featherman/operator/internal/controller"
-	"github.com/TFMV/featherman/operator/internal/duckdb"
-	"github.com/TFMV/featherman/operator/internal/sql"
-	// +kubebuilder:scaffold:imports
 )
 
 var (
@@ -68,6 +69,8 @@ func main() {
 	var secureMetrics bool
 	var enableHTTP2 bool
 	var tlsOpts []func(*tls.Config)
+	var catalogPath string
+
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "The address the metric endpoint binds to.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
 	flag.BoolVar(&enableLeaderElection, "leader-elect", false,
@@ -84,6 +87,7 @@ func main() {
 	flag.StringVar(&metricsCertKey, "metrics-cert-key", "tls.key", "The name of the metrics server key file.")
 	flag.BoolVar(&enableHTTP2, "enable-http2", false,
 		"If set, HTTP/2 will be enabled for the metrics and webhook servers")
+	flag.StringVar(&catalogPath, "catalog-path", "/var/lib/featherman", "Path to store DuckDB catalog files")
 	opts := zap.Options{
 		Development: true,
 	}
@@ -252,13 +256,55 @@ func main() {
 		}
 	}
 
-	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
-		setupLog.Error(err, "unable to set up health check")
+	// Create S3 client for health checks
+	cfg, err := config.LoadDefaultConfig(context.Background())
+	if err != nil {
+		setupLog.Error(err, "unable to load AWS SDK config")
 		os.Exit(1)
 	}
-	if err := mgr.AddReadyzCheck("readyz", healthz.Ping); err != nil {
-		setupLog.Error(err, "unable to set up ready check")
+	s3Client := s3.NewFromConfig(cfg)
+
+	// Add health checks
+	if err := mgr.AddHealthzCheck("s3", health.S3Check(s3Client)); err != nil {
+		setupLog.Error(err, "unable to set up S3 health check")
 		os.Exit(1)
+	}
+
+	if err := mgr.AddHealthzCheck("kubernetes", health.KubernetesCheck(k8sClient)); err != nil {
+		setupLog.Error(err, "unable to set up Kubernetes health check")
+		os.Exit(1)
+	}
+
+	if err := mgr.AddHealthzCheck("catalogfs", health.CatalogFSCheck(catalogPath)); err != nil {
+		setupLog.Error(err, "unable to set up catalog filesystem health check")
+		os.Exit(1)
+	}
+
+	if err := mgr.AddHealthzCheck("resource", health.ResourceCheck(k8sClient)); err != nil {
+		setupLog.Error(err, "unable to set up resource health check")
+		os.Exit(1)
+	}
+
+	if enableLeaderElection {
+		isLeader := func() bool {
+			select {
+			case <-mgr.Elected():
+				return true
+			default:
+				return false
+			}
+		}
+		if err := mgr.AddHealthzCheck("leader", health.LeaderCheck(isLeader)); err != nil {
+			setupLog.Error(err, "unable to set up leader health check")
+			os.Exit(1)
+		}
+	}
+
+	if len(webhookCertPath) > 0 {
+		if err := mgr.AddHealthzCheck("webhook", health.WebhookCertCheck(webhookCertPath)); err != nil {
+			setupLog.Error(err, "unable to set up webhook certificate health check")
+			os.Exit(1)
+		}
 	}
 
 	setupLog.Info("starting manager")
