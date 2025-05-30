@@ -11,6 +11,7 @@ import (
 	awss3 "github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/rs/zerolog"
 	corev1 "k8s.io/api/core/v1"
+	storagev1 "k8s.io/api/storage/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -45,6 +46,9 @@ type DuckLakeCatalogReconciler struct {
 // +kubebuilder:rbac:groups=core,resources=persistentvolumeclaims,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=secrets,verbs=get;list;watch
 // +kubebuilder:rbac:groups=core,resources=events,verbs=create;patch
+// +kubebuilder:rbac:groups=core,resources=configmaps,verbs=get;list;watch
+// +kubebuilder:rbac:groups=core,resources=nodes,verbs=get;list;watch
+// +kubebuilder:rbac:groups=storage.k8s.io,resources=storageclasses,verbs=get;list;watch
 
 // Reconcile handles DuckLakeCatalog resources
 func (r *DuckLakeCatalogReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -90,10 +94,41 @@ func (r *DuckLakeCatalogReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		}
 	}
 
+	// Validate storage class
+	storageClass := &storagev1.StorageClass{}
+	if err := r.Get(ctx, client.ObjectKey{Name: catalog.Spec.StorageClass}, storageClass); err != nil {
+		if errors.IsNotFound(err) {
+			l.Error().Str("storageClass", catalog.Spec.StorageClass).Msg("storage class not found")
+			r.setCondition(catalog, "Ready", metav1.ConditionFalse, "StorageClassNotFound", fmt.Sprintf("Storage class %s not found", catalog.Spec.StorageClass))
+			catalog.Status.Phase = ducklakev1alpha1.CatalogPhaseFailed
+			if err := r.Status().Update(ctx, catalog); err != nil {
+				l.Error().Err(err).Msg("failed to update status")
+			}
+			return ctrl.Result{}, fmt.Errorf("storage class %s not found", catalog.Spec.StorageClass)
+		}
+		return ctrl.Result{}, fmt.Errorf("failed to get storage class: %w", err)
+	}
+
+	// Validate S3 credentials and connection
+	if err := r.validateS3Connection(ctx, catalog); err != nil {
+		l.Error().Err(err).Msg("failed to validate S3 connection")
+		r.setCondition(catalog, "Ready", metav1.ConditionFalse, "S3ConnectionFailed", fmt.Sprintf("Failed to connect to S3: %v", err))
+		catalog.Status.Phase = ducklakev1alpha1.CatalogPhaseFailed
+		if err := r.Status().Update(ctx, catalog); err != nil {
+			l.Error().Err(err).Msg("failed to update status")
+		}
+		return ctrl.Result{}, fmt.Errorf("failed to validate S3 connection: %w", err)
+	}
+
 	// Create or update PVC
 	pvc, err := r.reconcilePVC(ctx, catalog)
 	if err != nil {
+		l.Error().Err(err).Msg("failed to reconcile PVC")
+		r.setCondition(catalog, "Ready", metav1.ConditionFalse, "PVCReconcileFailed", fmt.Sprintf("Failed to reconcile PVC: %v", err))
 		catalog.Status.Phase = ducklakev1alpha1.CatalogPhaseFailed
+		if err := r.Status().Update(ctx, catalog); err != nil {
+			l.Error().Err(err).Msg("failed to update status")
+		}
 		metrics.RecordTableOperation("reconcile_pvc", "failed")
 		r.Recorder.Event(catalog, corev1.EventTypeWarning, "PVCReconcileFailed", err.Error())
 		return ctrl.Result{}, fmt.Errorf("failed to reconcile PVC: %w", err)
@@ -111,6 +146,7 @@ func (r *DuckLakeCatalogReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	if catalog.Spec.BackupPolicy != nil {
 		if err := r.Backup.ScheduleBackup(ctx, catalog); err != nil {
 			l.Error().Err(err).Msg("failed to schedule backup")
+			r.setCondition(catalog, "Ready", metav1.ConditionFalse, "BackupScheduleFailed", fmt.Sprintf("Failed to schedule backup: %v", err))
 			r.Recorder.Event(catalog, corev1.EventTypeWarning, "BackupScheduleFailed", err.Error())
 			return ctrl.Result{}, fmt.Errorf("failed to schedule backup: %w", err)
 		}
@@ -118,6 +154,7 @@ func (r *DuckLakeCatalogReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	}
 
 	// Update status
+	r.setCondition(catalog, "Ready", metav1.ConditionTrue, "CatalogReady", "Catalog is ready")
 	catalog.Status.Phase = ducklakev1alpha1.CatalogPhaseSucceeded
 	catalog.Status.ObservedGeneration = catalog.Generation
 	if err := r.Status().Update(ctx, catalog); err != nil {
@@ -128,6 +165,65 @@ func (r *DuckLakeCatalogReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 
 	l.Info().Msg("reconciled DuckLakeCatalog successfully")
 	return ctrl.Result{}, nil
+}
+
+// validateS3Connection validates the S3 connection using the provided credentials
+func (r *DuckLakeCatalogReconciler) validateS3Connection(ctx context.Context, catalog *ducklakev1alpha1.DuckLakeCatalog) error {
+	// Get S3 credentials from secret
+	secret := &corev1.Secret{}
+	if err := r.Get(ctx, client.ObjectKey{
+		Namespace: catalog.Namespace,
+		Name:      catalog.Spec.ObjectStore.CredentialsSecret.Name,
+	}, secret); err != nil {
+		return fmt.Errorf("failed to get S3 credentials secret: %w", err)
+	}
+
+	accessKey := string(secret.Data["access-key"])
+	secretKey := string(secret.Data["secret-key"])
+
+	// Create S3 client
+	s3Client := awss3.NewFromConfig(aws.Config{
+		Region: "us-east-1", // MinIO doesn't require a specific region
+		Credentials: credentials.NewStaticCredentialsProvider(
+			accessKey,
+			secretKey,
+			"",
+		),
+	}, func(o *awss3.Options) {
+		o.BaseEndpoint = &catalog.Spec.ObjectStore.Endpoint
+		o.UsePathStyle = true
+	})
+
+	// Test connection by listing buckets
+	_, err := s3Client.ListBuckets(ctx, &awss3.ListBucketsInput{})
+	if err != nil {
+		return fmt.Errorf("failed to list buckets: %w", err)
+	}
+
+	return nil
+}
+
+// setCondition updates the condition in the catalog status
+func (r *DuckLakeCatalogReconciler) setCondition(catalog *ducklakev1alpha1.DuckLakeCatalog, conditionType string, status metav1.ConditionStatus, reason, message string) {
+	now := metav1.Now()
+	condition := metav1.Condition{
+		Type:               conditionType,
+		Status:             status,
+		Reason:             reason,
+		Message:            message,
+		LastTransitionTime: now,
+	}
+
+	// Find and update existing condition or append new one
+	for i, c := range catalog.Status.Conditions {
+		if c.Type == conditionType {
+			if c.Status != status {
+				catalog.Status.Conditions[i] = condition
+			}
+			return
+		}
+	}
+	catalog.Status.Conditions = append(catalog.Status.Conditions, condition)
 }
 
 // handleDeletion handles the deletion of a DuckLakeCatalog
@@ -211,30 +307,34 @@ func (r *DuckLakeCatalogReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	r.RetryConfig = retry.DefaultRetryConfig
 
 	// Initialize S3 client
+	customEndpoint := "http://minio.minio-test.svc.cluster.local:9000"
 	s3Client := awss3.NewFromConfig(aws.Config{
-		Region: "us-east-1", // Default region, will be overridden by endpoint resolver
-		EndpointResolverWithOptions: aws.EndpointResolverWithOptionsFunc(func(service, region string, options ...interface{}) (aws.Endpoint, error) {
-			return aws.Endpoint{
-				URL:               "http://minio:9000", // Default MinIO endpoint
-				SigningRegion:     "us-east-1",
-				HostnameImmutable: true,
-			}, nil
-		}),
+		Region: "us-east-1",
 		Credentials: credentials.NewStaticCredentialsProvider(
 			"minioadmin", // Default MinIO access key
 			"minioadmin", // Default MinIO secret key
 			"",
 		),
+	}, func(o *awss3.Options) {
+		o.BaseEndpoint = &customEndpoint
+		o.UsePathStyle = true
 	})
 
 	// Initialize backup manager
 	r.Backup = backup.NewBackupManager(r.Client, s3Client, r.Logger)
-	if err := r.Backup.Start(context.Background()); err != nil {
-		return fmt.Errorf("failed to start backup manager: %w", err)
-	}
 
 	// Add cleanup on shutdown
 	if err := mgr.Add(manager.RunnableFunc(func(ctx context.Context) error {
+		// Wait for cache to be ready
+		if !mgr.GetCache().WaitForCacheSync(ctx) {
+			return fmt.Errorf("failed to wait for caches to sync")
+		}
+
+		// Start backup manager after cache is ready
+		if err := r.Backup.Start(ctx); err != nil {
+			return fmt.Errorf("failed to start backup manager: %w", err)
+		}
+
 		<-ctx.Done()
 		r.Backup.Stop()
 		return nil
@@ -244,5 +344,6 @@ func (r *DuckLakeCatalogReconciler) SetupWithManager(mgr ctrl.Manager) error {
 
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&ducklakev1alpha1.DuckLakeCatalog{}).
+		Owns(&corev1.PersistentVolumeClaim{}).
 		Complete(r)
 }

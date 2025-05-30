@@ -20,15 +20,17 @@ import (
 	"context"
 	"crypto/tls"
 	"flag"
+	"net/http"
 	"os"
 	"path/filepath"
+	"time"
 
 	ducklakev1alpha1 "github.com/TFMV/featherman/operator/api/v1alpha1"
 	"github.com/TFMV/featherman/operator/internal/controller"
 	"github.com/TFMV/featherman/operator/internal/duckdb"
-	"github.com/TFMV/featherman/operator/internal/health"
 	"github.com/TFMV/featherman/operator/internal/sql"
-	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
@@ -41,6 +43,7 @@ import (
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/certwatcher"
+	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	"sigs.k8s.io/controller-runtime/pkg/metrics/filters"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
@@ -54,7 +57,6 @@ var (
 
 func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
-
 	utilruntime.Must(ducklakev1alpha1.AddToScheme(scheme))
 	// +kubebuilder:scaffold:scheme
 }
@@ -161,11 +163,6 @@ func main() {
 	// If the certificate is not specified, controller-runtime will automatically
 	// generate self-signed certificates for the metrics server. While convenient for development and testing,
 	// this setup is not recommended for production.
-	//
-	// TODO(user): If you enable certManager, uncomment the following lines:
-	// - [METRICS-WITH-CERTS] at config/default/kustomization.yaml to generate and use certificates
-	// managed by cert-manager for the metrics server.
-	// - [PROMETHEUS-WITH-CERTS] at config/prometheus/kustomization.yaml for TLS certification.
 	if len(metricsCertPath) > 0 {
 		setupLog.Info("Initializing metrics certificate watcher using provided certificates",
 			"metrics-cert-path", metricsCertPath, "metrics-cert-name", metricsCertName, "metrics-cert-key", metricsCertKey)
@@ -192,17 +189,6 @@ func main() {
 		HealthProbeBindAddress: probeAddr,
 		LeaderElection:         enableLeaderElection,
 		LeaderElectionID:       "featherman-operator-lock",
-		// LeaderElectionReleaseOnCancel defines if the leader should step down voluntarily
-		// when the Manager ends. This requires the binary to immediately end when the
-		// Manager is stopped, otherwise, this setting is unsafe. Setting this significantly
-		// speeds up voluntary leader transitions as the new leader don't have to wait
-		// LeaseDuration time first.
-		//
-		// In the default scaffold provided, the program ends immediately after
-		// the manager stops, so would be fine to enable this option. However,
-		// if you are doing or is intended to do any operation such as perform cleanups
-		// after the manager stops then its usage might be unsafe.
-		// LeaderElectionReleaseOnCancel: true,
 	})
 	if err != nil {
 		setupLog.Error(err, "unable to start manager")
@@ -220,25 +206,72 @@ func main() {
 	// Create SQL Generator
 	sqlGen := sql.NewGenerator()
 
-	if err := (&controller.DuckLakeCatalogReconciler{
+	// Create S3 client for health checks
+	customEndpoint := "http://minio.minio-test.svc.cluster.local:9000"
+	s3Client := s3.NewFromConfig(aws.Config{
+		Region: "us-east-1",
+		Credentials: credentials.NewStaticCredentialsProvider(
+			"minioadmin", // Default MinIO access key
+			"minioadmin", // Default MinIO secret key
+			"",
+		),
+	}, func(o *s3.Options) {
+		o.BaseEndpoint = &customEndpoint
+		o.UsePathStyle = true
+	})
+
+	// Add health checks
+	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
+		setupLog.Error(err, "unable to set up health check")
+		os.Exit(1)
+	}
+
+	if err := mgr.AddReadyzCheck("readyz", healthz.Ping); err != nil {
+		setupLog.Error(err, "unable to set up ready check")
+		os.Exit(1)
+	}
+
+	if err := mgr.AddReadyzCheck("s3", func(_ *http.Request) error {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_, err := s3Client.ListBuckets(ctx, &s3.ListBucketsInput{})
+		return err
+	}); err != nil {
+		setupLog.Error(err, "unable to set up S3 health check")
+		os.Exit(1)
+	}
+
+	if err := mgr.AddReadyzCheck("kubernetes", func(_ *http.Request) error {
+		return k8sClient.RESTClient().Get().AbsPath("/healthz").Do(context.Background()).Error()
+	}); err != nil {
+		setupLog.Error(err, "unable to set up Kubernetes health check")
+		os.Exit(1)
+	}
+
+	// Initialize controllers
+	catalogReconciler := &controller.DuckLakeCatalogReconciler{
 		Client:   mgr.GetClient(),
 		Scheme:   mgr.GetScheme(),
 		Recorder: mgr.GetEventRecorderFor("ducklakecatalog-controller"),
-	}).SetupWithManager(mgr); err != nil {
-		setupLog.Error(err, "unable to create controller", "controller", "DuckLakeCatalog")
-		os.Exit(1)
 	}
-	if err := (&controller.DuckLakeTableReconciler{
+
+	tableReconciler := &controller.DuckLakeTableReconciler{
 		Client:     mgr.GetClient(),
 		Scheme:     mgr.GetScheme(),
 		Recorder:   mgr.GetEventRecorderFor("ducklaketable-controller"),
 		JobManager: jobManager,
 		SQLGen:     sqlGen,
-	}).SetupWithManager(mgr); err != nil {
+	}
+
+	if err := catalogReconciler.SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "DuckLakeCatalog")
+		os.Exit(1)
+	}
+
+	if err := tableReconciler.SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "DuckLakeTable")
 		os.Exit(1)
 	}
-	// +kubebuilder:scaffold:builder
 
 	if metricsCertWatcher != nil {
 		setupLog.Info("Adding metrics certificate watcher to manager")
@@ -252,57 +285,6 @@ func main() {
 		setupLog.Info("Adding webhook certificate watcher to manager")
 		if err := mgr.Add(webhookCertWatcher); err != nil {
 			setupLog.Error(err, "unable to add webhook certificate watcher to manager")
-			os.Exit(1)
-		}
-	}
-
-	// Create S3 client for health checks
-	cfg, err := config.LoadDefaultConfig(context.Background())
-	if err != nil {
-		setupLog.Error(err, "unable to load AWS SDK config")
-		os.Exit(1)
-	}
-	s3Client := s3.NewFromConfig(cfg)
-
-	// Add health checks
-	if err := mgr.AddHealthzCheck("s3", health.S3Check(s3Client)); err != nil {
-		setupLog.Error(err, "unable to set up S3 health check")
-		os.Exit(1)
-	}
-
-	if err := mgr.AddHealthzCheck("kubernetes", health.KubernetesCheck(k8sClient)); err != nil {
-		setupLog.Error(err, "unable to set up Kubernetes health check")
-		os.Exit(1)
-	}
-
-	if err := mgr.AddHealthzCheck("catalogfs", health.CatalogFSCheck(catalogPath)); err != nil {
-		setupLog.Error(err, "unable to set up catalog filesystem health check")
-		os.Exit(1)
-	}
-
-	if err := mgr.AddHealthzCheck("resource", health.ResourceCheck(k8sClient)); err != nil {
-		setupLog.Error(err, "unable to set up resource health check")
-		os.Exit(1)
-	}
-
-	if enableLeaderElection {
-		isLeader := func() bool {
-			select {
-			case <-mgr.Elected():
-				return true
-			default:
-				return false
-			}
-		}
-		if err := mgr.AddHealthzCheck("leader", health.LeaderCheck(isLeader)); err != nil {
-			setupLog.Error(err, "unable to set up leader health check")
-			os.Exit(1)
-		}
-	}
-
-	if len(webhookCertPath) > 0 {
-		if err := mgr.AddHealthzCheck("webhook", health.WebhookCertCheck(webhookCertPath)); err != nil {
-			setupLog.Error(err, "unable to set up webhook certificate health check")
 			os.Exit(1)
 		}
 	}
