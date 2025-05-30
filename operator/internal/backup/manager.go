@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/robfig/cron/v3"
 	"github.com/rs/zerolog"
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -228,15 +229,88 @@ func (m *BackupManager) CleanupOldBackups(ctx context.Context, catalog *ducklake
 
 	// List backups
 	prefix := path.Join("backups", catalog.Namespace, catalog.Name)
-	// TODO: Implement S3 list and delete operations for old backups
-	// Use time.Now().Add(-time.Duration(retentionDays) * 24 * time.Hour) as cutoff
+	input := &s3.ListObjectsV2Input{
+		Bucket: &catalog.Spec.ObjectStore.Bucket,
+		Prefix: &prefix,
+	}
 
-	l.Info().
-		Str("catalog", catalog.Name).
-		Str("namespace", catalog.Namespace).
-		Str("prefix", prefix).
-		Int("retentionDays", retentionDays).
-		Msg("cleaned up old backups")
+	var objectsToDelete []s3types.ObjectIdentifier
+	cutoff := time.Now().Add(-time.Duration(retentionDays) * 24 * time.Hour)
+
+	paginator := s3.NewListObjectsV2Paginator(m.s3Client, input)
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(ctx)
+		if err != nil {
+			l.Error().
+				Err(err).
+				Str("catalog", catalog.Name).
+				Str("namespace", catalog.Namespace).
+				Str("prefix", prefix).
+				Msg("failed to list backups")
+			return fmt.Errorf("failed to list backups: %w", err)
+		}
+
+		for _, obj := range page.Contents {
+			if obj.LastModified.Before(cutoff) {
+				objectsToDelete = append(objectsToDelete, s3types.ObjectIdentifier{
+					Key: obj.Key,
+				})
+				l.Debug().
+					Str("catalog", catalog.Name).
+					Str("namespace", catalog.Namespace).
+					Str("key", *obj.Key).
+					Time("lastModified", *obj.LastModified).
+					Msg("marking backup for deletion")
+			}
+		}
+	}
+
+	// Delete old backups
+	if len(objectsToDelete) > 0 {
+		deleteInput := &s3.DeleteObjectsInput{
+			Bucket: &catalog.Spec.ObjectStore.Bucket,
+			Delete: &s3types.Delete{
+				Objects: objectsToDelete,
+			},
+		}
+
+		output, err := m.s3Client.DeleteObjects(ctx, deleteInput)
+		if err != nil {
+			l.Error().
+				Err(err).
+				Str("catalog", catalog.Name).
+				Str("namespace", catalog.Namespace).
+				Int("count", len(objectsToDelete)).
+				Msg("failed to delete old backups")
+			return fmt.Errorf("failed to delete old backups: %w", err)
+		}
+
+		if len(output.Errors) > 0 {
+			for _, err := range output.Errors {
+				l.Error().
+					Str("catalog", catalog.Name).
+					Str("namespace", catalog.Namespace).
+					Str("key", *err.Key).
+					Str("code", *err.Code).
+					Str("message", *err.Message).
+					Msg("failed to delete backup")
+			}
+			return fmt.Errorf("failed to delete some backups")
+		}
+
+		l.Info().
+			Str("catalog", catalog.Name).
+			Str("namespace", catalog.Namespace).
+			Int("count", len(objectsToDelete)).
+			Int("retentionDays", retentionDays).
+			Msg("cleaned up old backups")
+	} else {
+		l.Debug().
+			Str("catalog", catalog.Name).
+			Str("namespace", catalog.Namespace).
+			Int("retentionDays", retentionDays).
+			Msg("no old backups to clean up")
+	}
 
 	return nil
 }
