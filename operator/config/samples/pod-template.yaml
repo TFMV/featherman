@@ -1,0 +1,44 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ducklake-pod-template
+  namespace: system
+data:
+  config: |
+    {
+      "resources": {
+        "requests": {
+          "cpu": "200m",
+          "memory": "512Mi"
+        },
+        "limits": {
+          "cpu": "2",
+          "memory": "2Gi"
+        }
+      },
+      "securityContext": {
+        "runAsNonRoot": true,
+        "runAsUser": 1000,
+        "fsGroup": 1000
+      },
+      "nodeSelector": {
+        "kubernetes.io/os": "linux"
+      },
+      "tolerations": [
+        {
+          "key": "node-role.kubernetes.io/control-plane",
+          "operator": "Exists",
+          "effect": "NoSchedule"
+        }
+      ],
+      "env": [
+        {
+          "name": "DUCKDB_MEMORY_LIMIT",
+          "value": "1GB"
+        },
+        {
+          "name": "DUCKDB_THREADS",
+          "value": "4"
+        }
+      ]
+    }
