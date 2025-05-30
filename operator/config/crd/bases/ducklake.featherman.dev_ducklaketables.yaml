@@ -18,8 +18,8 @@ spec:
     - jsonPath: .status.phase
       name: Phase
       type: string
-    - jsonPath: .spec.catalogRef
-      name: Catalog
+    - jsonPath: .spec.mode
+      name: Mode
       type: string
     - jsonPath: .metadata.creationTimestamp
       name: Age
@@ -54,7 +54,7 @@ spec:
                   belongs to
                 type: string
               columns:
-                description: Columns defines the schema of the table
+                description: Columns defines the table columns
                 items:
                   description: ColumnDefinition defines a column in the table
                   properties:
@@ -62,15 +62,15 @@ spec:
                       description: Comment provides documentation for the column
                       type: string
                     name:
-                      description: Name of the column
-                      pattern: '[a-zA-Z][a-zA-Z0-9_]*'
+                      description: Name is the column name
+                      pattern: ^[a-zA-Z][a-zA-Z0-9_]*$
                       type: string
                     nullable:
                       description: Nullable specifies if the column can contain NULL
                         values
                       type: boolean
                     type:
-                      description: Type is the SQL data type of the column
+                      description: Type is the SQL data type
                       enum:
                       - INTEGER
                       - BIGINT
@@ -94,49 +94,92 @@ spec:
                 description: Format specifies the Parquet format configuration
                 properties:
                   compression:
-                    description: Compression algorithm to use
+                    description: Compression specifies the compression algorithm
                     enum:
-                    - SNAPPY
                     - ZSTD
-                    - NONE
+                    - SNAPPY
                     type: string
-                  rowGroupSize:
-                    description: RowGroupSize specifies the size of row groups in
-                      bytes
-                    format: int64
-                    minimum: 1048576
-                    type: integer
+                  partitioning:
+                    description: Partitioning specifies the partition columns
+                    items:
+                      type: string
+                    type: array
+                required:
+                - compression
                 type: object
+              location:
+                description: Location is the object store path for Parquet files
+                pattern: ^[a-zA-Z0-9-_./]+$
+                type: string
               mode:
-                description: Mode specifies how to handle existing data
+                description: Mode specifies the table write mode
                 enum:
                 - append
                 - overwrite
                 type: string
               name:
-                description: Name is the name of the table
-                pattern: '[a-zA-Z][a-zA-Z0-9_]*'
+                description: Name is the table name
+                pattern: ^[a-zA-Z][a-zA-Z0-9_]*$
                 type: string
-              partitioning:
-                description: Partitioning defines the partition columns
-                items:
-                  type: string
-                type: array
+              objectStore:
+                description: |-
+                  ObjectStore defines the S3-compatible storage configuration
+                  If not specified, the configuration from the referenced catalog will be used
+                properties:
+                  bucket:
+                    description: Bucket is the name of the S3 bucket to use
+                    maxLength: 63
+                    minLength: 3
+                    type: string
+                  credentialsSecret:
+                    description: CredentialsSecret references the secret containing
+                      AWS credentials
+                    properties:
+                      accessKeyField:
+                        default: access-key
+                        description: AccessKeyField is the field in the secret containing
+                          the access key
+                        type: string
+                      name:
+                        description: Name is the name of the secret
+                        type: string
+                      secretKeyField:
+                        default: secret-key
+                        description: SecretKeyField is the field in the secret containing
+                          the secret key
+                        type: string
+                    required:
+                    - name
+                    type: object
+                  endpoint:
+                    description: Endpoint is the S3-compatible endpoint URL
+                    pattern: ^https?:\/\/.*
+                    type: string
+                  region:
+                    description: Region is the S3 region (optional for some providers)
+                    type: string
+                required:
+                - bucket
+                - credentialsSecret
+                - endpoint
+                type: object
               ttlDays:
-                description: TTLDays specifies the number of days to retain data
-                format: int32
+                description: TTLDays specifies the data retention period in days
                 minimum: 1
                 type: integer
             required:
             - catalogRef
             - columns
+            - format
+            - location
+            - mode
             - name
             type: object
           status:
             description: DuckLakeTableStatus defines the observed state of DuckLakeTable
             properties:
               bytesWritten:
-                description: BytesWritten is the total bytes written to this table
+                description: BytesWritten is the total bytes written
                 format: int64
                 type: integer
               conditions:
@@ -198,11 +241,11 @@ spec:
                   type: object
                 type: array
               lastAppliedSnapshot:
-                description: LastAppliedSnapshot is the ID of the last successful
-                  snapshot
+                description: LastAppliedSnapshot is the latest successful snapshot
+                  ID
                 type: string
               lastModified:
-                description: LastModified is when the table was last modified
+                description: LastModified is the last modification timestamp
                 format: date-time
                 type: string
               observedGeneration:
@@ -211,11 +254,10 @@ spec:
                 format: int64
                 type: integer
               phase:
-                description: Phase represents the current phase of the table
+                description: Phase is the current phase of the table
                 enum:
                 - Pending
-                - Creating
-                - Ready
+                - Succeeded
                 - Failed
                 type: string
             type: object
