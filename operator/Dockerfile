@@ -23,16 +23,14 @@ COPY internal/ internal/
 # by leaving it empty we can ensure that the container and binary shipped on it will have the same platform.
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -a -o manager cmd/main.go
 
-# Create required directories in builder stage
+# Create directory for catalog files
 RUN mkdir -p /var/lib/featherman
 
-# Use distroless as minimal base image to package the manager binary
-# Refer to https://github.com/GoogleContainerTools/distroless for more details
-FROM gcr.io/distroless/static:nonroot
+# Use alpine as minimal base image
+FROM --platform=linux/amd64 alpine:3.19
 
 WORKDIR /
 COPY --from=builder /workspace/manager .
-# Copy the required directory from builder
 COPY --from=builder /var/lib/featherman /var/lib/featherman
 
 USER 65532:65532

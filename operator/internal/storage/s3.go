@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -215,4 +216,111 @@ func (c *s3Client) WaitForParquetConsistency(ctx context.Context, key string, ti
 	}
 
 	return fmt.Errorf("timeout waiting for Parquet file consistency")
+}
+
+// NewObjectStore creates a new ObjectStore implementation from an S3 client
+func NewObjectStore(s3Client *s3.Client) ObjectStore {
+	return &s3ObjectStore{
+		client: s3Client,
+	}
+}
+
+// s3ObjectStore implements the ObjectStore interface using AWS S3
+type s3ObjectStore struct {
+	client *s3.Client
+}
+
+func (s *s3ObjectStore) ListBuckets(ctx context.Context) ([]string, error) {
+	result, err := s.client.ListBuckets(ctx, &s3.ListBucketsInput{})
+	if err != nil {
+		return nil, fmt.Errorf("failed to list buckets: %w", err)
+	}
+
+	var buckets []string
+	for _, bucket := range result.Buckets {
+		buckets = append(buckets, *bucket.Name)
+	}
+	return buckets, nil
+}
+
+func (s *s3ObjectStore) CreateBucket(ctx context.Context, bucket string) error {
+	_, err := s.client.CreateBucket(ctx, &s3.CreateBucketInput{
+		Bucket: aws.String(bucket),
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create bucket: %w", err)
+	}
+	return nil
+}
+
+func (s *s3ObjectStore) DeleteBucket(ctx context.Context, bucket string) error {
+	_, err := s.client.DeleteBucket(ctx, &s3.DeleteBucketInput{
+		Bucket: aws.String(bucket),
+	})
+	if err != nil {
+		return fmt.Errorf("failed to delete bucket: %w", err)
+	}
+	return nil
+}
+
+func (s *s3ObjectStore) ListObjects(ctx context.Context, bucket, prefix string) ([]string, error) {
+	var objects []string
+	paginator := s3.NewListObjectsV2Paginator(s.client, &s3.ListObjectsV2Input{
+		Bucket: aws.String(bucket),
+		Prefix: aws.String(prefix),
+	})
+
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("failed to list objects: %w", err)
+		}
+
+		for _, obj := range page.Contents {
+			objects = append(objects, *obj.Key)
+		}
+	}
+
+	return objects, nil
+}
+
+func (s *s3ObjectStore) GetObject(ctx context.Context, bucket, key string) ([]byte, error) {
+	result, err := s.client.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(bucket),
+		Key:    aws.String(key),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to get object: %w", err)
+	}
+	defer result.Body.Close()
+
+	data, err := io.ReadAll(result.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read object body: %w", err)
+	}
+
+	return data, nil
+}
+
+func (s *s3ObjectStore) PutObject(ctx context.Context, bucket, key string, data []byte) error {
+	_, err := s.client.PutObject(ctx, &s3.PutObjectInput{
+		Bucket: aws.String(bucket),
+		Key:    aws.String(key),
+		Body:   bytes.NewReader(data),
+	})
+	if err != nil {
+		return fmt.Errorf("failed to put object: %w", err)
+	}
+	return nil
+}
+
+func (s *s3ObjectStore) DeleteObject(ctx context.Context, bucket, key string) error {
+	_, err := s.client.DeleteObject(ctx, &s3.DeleteObjectInput{
+		Bucket: aws.String(bucket),
+		Key:    aws.String(key),
+	})
+	if err != nil {
+		return fmt.Errorf("failed to delete object: %w", err)
+	}
+	return nil
 }

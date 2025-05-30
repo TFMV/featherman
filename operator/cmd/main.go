@@ -13,6 +13,7 @@ import (
 	"github.com/TFMV/featherman/operator/internal/controller"
 	"github.com/TFMV/featherman/operator/internal/duckdb"
 	"github.com/TFMV/featherman/operator/internal/sql"
+	"github.com/TFMV/featherman/operator/internal/storage"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -237,6 +238,7 @@ func main() {
 		Client:   mgr.GetClient(),
 		Scheme:   mgr.GetScheme(),
 		Recorder: mgr.GetEventRecorderFor("ducklakecatalog-controller"),
+		Storage:  storage.NewObjectStore(s3Client),
 	}
 
 	tableReconciler := &controller.DuckLakeTableReconciler{

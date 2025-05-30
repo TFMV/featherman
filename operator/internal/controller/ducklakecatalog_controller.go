@@ -27,6 +27,7 @@ import (
 	"github.com/TFMV/featherman/operator/internal/logger"
 	"github.com/TFMV/featherman/operator/internal/metrics"
 	"github.com/TFMV/featherman/operator/internal/retry"
+	"github.com/TFMV/featherman/operator/internal/storage"
 )
 
 // DuckLakeCatalogReconciler reconciles a DuckLakeCatalog object
@@ -37,6 +38,7 @@ type DuckLakeCatalogReconciler struct {
 	Logger      *zerolog.Logger
 	RetryConfig retry.RetryConfig
 	Backup      *backup.BackupManager
+	Storage     storage.ObjectStore
 }
 
 // +kubebuilder:rbac:groups=ducklake.featherman.dev,resources=ducklakecatalogs,verbs=get;list;watch;create;update;patch;delete
@@ -178,24 +180,8 @@ func (r *DuckLakeCatalogReconciler) validateS3Connection(ctx context.Context, ca
 		return fmt.Errorf("failed to get S3 credentials secret: %w", err)
 	}
 
-	accessKey := string(secret.Data["access-key"])
-	secretKey := string(secret.Data["secret-key"])
-
-	// Create S3 client
-	s3Client := awss3.NewFromConfig(aws.Config{
-		Region: "us-east-1", // MinIO doesn't require a specific region
-		Credentials: credentials.NewStaticCredentialsProvider(
-			accessKey,
-			secretKey,
-			"",
-		),
-	}, func(o *awss3.Options) {
-		o.BaseEndpoint = &catalog.Spec.ObjectStore.Endpoint
-		o.UsePathStyle = true
-	})
-
 	// Test connection by listing buckets
-	_, err := s3Client.ListBuckets(ctx, &awss3.ListBucketsInput{})
+	_, err := r.Storage.ListBuckets(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to list buckets: %w", err)
 	}
