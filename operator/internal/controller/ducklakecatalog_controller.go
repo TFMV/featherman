@@ -103,7 +103,7 @@ func (r *DuckLakeCatalogReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	// Update storage metrics
 	if pvc.Status.Phase == corev1.ClaimBound {
 		if quantity, ok := pvc.Status.Capacity[corev1.ResourceStorage]; ok {
-			metrics.UpdateStorageUsage(catalog.Name, "catalog", float64(quantity.Value()))
+			metrics.SetCatalogSize(catalog.Name, float64(quantity.Value()))
 		}
 	}
 
