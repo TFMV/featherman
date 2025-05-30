@@ -10,6 +10,34 @@ Featherman brings DuckDB's powerful DuckLake functionality to Kubernetes, enabli
 - 🔒 **Enterprise Ready**: Built-in backup, encryption, and monitoring
 - 🚀 **Kubernetes-Native**: Fully integrated with K8s ecosystem
 
+## Development Setup
+
+1. Prerequisites:
+   - Go 1.21+
+   - Docker
+   - KinD (Kubernetes in Docker)
+   - kubectl
+
+2. Set up local development cluster:
+
+```bash
+make kind-setup
+```
+
+3. Deploy MinIO (for local S3-compatible storage):
+
+```bash
+make minio-setup
+```
+
+4. Build and load the operator:
+
+```bash
+make docker-build
+make kind-load
+make deploy
+```
+
 ## Quick Start
 
 1. Install Featherman:
@@ -31,7 +59,8 @@ spec:
   objectStore:
     endpoint: s3.amazonaws.com
     bucket: my-data-lake
-    region: us-west-2
+    credentialsSecret:
+      name: s3-credentials
   backupPolicy:
     schedule: "0 2 * * *"    # Daily at 2 AM
     retentionDays: 7
@@ -97,6 +126,41 @@ graph TD
 2. **Stateless Operations**: All operations run in ephemeral jobs for reliability
 3. **Cloud-Native Storage**: Leverages object storage for data and K8s volumes for metadata
 4. **Kubernetes Patterns**: Follows standard K8s patterns like operator pattern and CRDs
+
+## Testing
+
+The operator includes comprehensive test suites:
+
+1. **Unit Tests**: Test individual components and functions
+
+```bash
+make test
+```
+
+2. **End-to-End Tests**: Test full operator functionality in a KinD cluster
+
+```bash
+make e2e-test
+```
+
+The E2E tests require:
+
+- Running KinD cluster
+- MinIO deployment (for S3 testing)
+- Controller image built and loaded
+- Proper RBAC and namespace configuration
+
+## Monitoring
+
+The operator exposes Prometheus metrics for:
+
+- Catalog operations (create, update, delete)
+- Storage usage
+- Backup status
+- Job durations
+- Error counts
+
+Access metrics at `:8080/metrics` endpoint (configurable).
 
 ## License
 
