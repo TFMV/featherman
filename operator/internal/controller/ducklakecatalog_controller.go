@@ -3,9 +3,13 @@ package controller
 import (
 	"context"
 	"fmt"
+	"os"
 	"time"
 
-	batchv1 "k8s.io/api/batch/v1"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/credentials"
+	awss3 "github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/rs/zerolog"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -15,13 +19,13 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
-	"sigs.k8s.io/controller-runtime/pkg/handler"
-	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/manager"
 
 	ducklakev1alpha1 "github.com/TFMV/featherman/operator/api/v1alpha1"
 	"github.com/TFMV/featherman/operator/internal/backup"
-	"github.com/TFMV/featherman/operator/internal/config"
+	"github.com/TFMV/featherman/operator/internal/logger"
 	"github.com/TFMV/featherman/operator/internal/metrics"
+	"github.com/TFMV/featherman/operator/internal/retry"
 )
 
 // DuckLakeCatalogReconciler reconciles a DuckLakeCatalog object
@@ -29,8 +33,9 @@ type DuckLakeCatalogReconciler struct {
 	client.Client
 	Scheme      *runtime.Scheme
 	Recorder    record.EventRecorder
-	PodTemplate *config.PodTemplateConfig
-	BackupMgr   *backup.Manager
+	Logger      *zerolog.Logger
+	RetryConfig retry.RetryConfig
+	Backup      *backup.BackupManager
 }
 
 // +kubebuilder:rbac:groups=ducklake.featherman.dev,resources=ducklakecatalogs,verbs=get;list;watch;create;update;patch;delete
@@ -43,8 +48,11 @@ type DuckLakeCatalogReconciler struct {
 
 // Reconcile handles DuckLakeCatalog resources
 func (r *DuckLakeCatalogReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	logger := log.FromContext(ctx)
-	logger.Info("reconciling DuckLakeCatalog", "namespacedName", req.NamespacedName)
+	l := logger.WithValues(r.Logger,
+		"controller", "DuckLakeCatalog",
+		"namespace", req.Namespace,
+		"name", req.Name)
+	ctx = logger.WithContext(ctx, l)
 
 	startTime := time.Now()
 	defer func() {
@@ -57,28 +65,8 @@ func (r *DuckLakeCatalogReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		if errors.IsNotFound(err) {
 			return ctrl.Result{}, nil
 		}
-		metrics.RecordTableOperation("get", "failed")
+		l.Error().Err(err).Msg("failed to get DuckLakeCatalog")
 		return ctrl.Result{}, fmt.Errorf("failed to get DuckLakeCatalog: %w", err)
-	}
-
-	// Initialize status if needed
-	if catalog.Status.Phase == "" {
-		catalog.Status.Phase = ducklakev1alpha1.CatalogPhasePending
-		if err := r.Status().Update(ctx, catalog); err != nil {
-			metrics.RecordTableOperation("status_update", "failed")
-			return ctrl.Result{}, fmt.Errorf("failed to update status: %w", err)
-		}
-		metrics.RecordTableOperation("status_update", "succeeded")
-	}
-
-	// Add finalizer
-	if !controllerutil.ContainsFinalizer(catalog, "ducklakecatalog.featherman.dev") {
-		controllerutil.AddFinalizer(catalog, "ducklakecatalog.featherman.dev")
-		if err := r.Update(ctx, catalog); err != nil {
-			metrics.RecordTableOperation("add_finalizer", "failed")
-			return ctrl.Result{}, fmt.Errorf("failed to add finalizer: %w", err)
-		}
-		metrics.RecordTableOperation("add_finalizer", "succeeded")
 	}
 
 	// Handle deletion
@@ -91,6 +79,15 @@ func (r *DuckLakeCatalogReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		}
 		metrics.RecordTableOperation("delete", "succeeded")
 		return result, nil
+	}
+
+	// Add finalizer
+	if !controllerutil.ContainsFinalizer(catalog, "ducklakecatalog.featherman.dev") {
+		controllerutil.AddFinalizer(catalog, "ducklakecatalog.featherman.dev")
+		if err := r.Update(ctx, catalog); err != nil {
+			l.Error().Err(err).Msg("failed to add finalizer")
+			return ctrl.Result{}, fmt.Errorf("failed to add finalizer: %w", err)
+		}
 	}
 
 	// Create or update PVC
@@ -110,13 +107,12 @@ func (r *DuckLakeCatalogReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		}
 	}
 
-	// Handle backup configuration
+	// Schedule backup if needed
 	if catalog.Spec.BackupPolicy != nil {
-		if err := r.reconcileBackup(ctx, catalog); err != nil {
-			catalog.Status.Phase = ducklakev1alpha1.CatalogPhaseFailed
-			metrics.RecordTableOperation("reconcile_backup", "failed")
-			r.Recorder.Event(catalog, corev1.EventTypeWarning, "BackupReconcileFailed", err.Error())
-			return ctrl.Result{}, fmt.Errorf("failed to reconcile backup: %w", err)
+		if err := r.Backup.ScheduleBackup(ctx, catalog); err != nil {
+			l.Error().Err(err).Msg("failed to schedule backup")
+			r.Recorder.Event(catalog, corev1.EventTypeWarning, "BackupScheduleFailed", err.Error())
+			return ctrl.Result{}, fmt.Errorf("failed to schedule backup: %w", err)
 		}
 		metrics.RecordTableOperation("reconcile_backup", "succeeded")
 	}
@@ -130,78 +126,19 @@ func (r *DuckLakeCatalogReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	}
 	metrics.RecordTableOperation("status_update", "succeeded")
 
-	logger.Info("reconciled DuckLakeCatalog successfully")
+	l.Info().Msg("reconciled DuckLakeCatalog successfully")
 	return ctrl.Result{}, nil
-}
-
-// reconcileBackup ensures the backup CronJob exists and is configured correctly
-func (r *DuckLakeCatalogReconciler) reconcileBackup(ctx context.Context, catalog *ducklakev1alpha1.DuckLakeCatalog) error {
-	// Create or update backup CronJob
-	cronJob, err := r.BackupMgr.CreateBackupCronJob(catalog)
-	if err != nil {
-		return fmt.Errorf("failed to create backup CronJob: %w", err)
-	}
-
-	// Apply the CronJob
-	if err := ctrl.SetControllerReference(catalog, cronJob, r.Scheme); err != nil {
-		return fmt.Errorf("failed to set controller reference: %w", err)
-	}
-
-	existingCronJob := &batchv1.CronJob{}
-	err = r.Get(ctx, client.ObjectKey{Name: cronJob.Name, Namespace: cronJob.Namespace}, existingCronJob)
-	if err != nil {
-		if errors.IsNotFound(err) {
-			if err := r.Create(ctx, cronJob); err != nil {
-				return fmt.Errorf("failed to create CronJob: %w", err)
-			}
-			r.Recorder.Event(catalog, corev1.EventTypeNormal, "BackupCreated", "Created backup CronJob")
-		} else {
-			return fmt.Errorf("failed to get CronJob: %w", err)
-		}
-	} else {
-		// Update existing CronJob
-		existingCronJob.Spec = cronJob.Spec
-		if err := r.Update(ctx, existingCronJob); err != nil {
-			return fmt.Errorf("failed to update CronJob: %w", err)
-		}
-		r.Recorder.Event(catalog, corev1.EventTypeNormal, "BackupUpdated", "Updated backup CronJob")
-	}
-
-	// Cleanup old backups
-	if err := r.BackupMgr.CleanupOldBackups(ctx, catalog); err != nil {
-		return fmt.Errorf("failed to cleanup old backups: %w", err)
-	}
-
-	// Update backup metrics
-	if catalog.Status.LastBackup != nil {
-		metrics.UpdateCatalogBackupStatus(catalog.Name, true)
-	} else {
-		metrics.UpdateCatalogBackupStatus(catalog.Name, false)
-	}
-
-	return nil
 }
 
 // handleDeletion handles the deletion of a DuckLakeCatalog
 func (r *DuckLakeCatalogReconciler) handleDeletion(ctx context.Context, catalog *ducklakev1alpha1.DuckLakeCatalog) (ctrl.Result, error) {
-	logger := log.FromContext(ctx)
-	logger.Info("handling DuckLakeCatalog deletion")
-
-	// Delete backup CronJob if it exists
-	cronJob := &batchv1.CronJob{}
-	cronJobName := fmt.Sprintf("%s-backup", catalog.Name)
-	err := r.Get(ctx, client.ObjectKey{Name: cronJobName, Namespace: catalog.Namespace}, cronJob)
-	if err == nil {
-		if err := r.Delete(ctx, cronJob); err != nil {
-			return ctrl.Result{}, fmt.Errorf("failed to delete backup CronJob: %w", err)
-		}
-		r.Recorder.Event(catalog, corev1.EventTypeNormal, "BackupDeleted", "Deleted backup CronJob")
-	}
+	l := logger.FromContext(ctx)
+	l.Info().Msg("handling DuckLakeCatalog deletion")
 
 	// Check if PVC exists
 	pvc := &corev1.PersistentVolumeClaim{}
 	pvcName := fmt.Sprintf("%s-catalog", catalog.Name)
-	err = r.Get(ctx, client.ObjectKey{Namespace: catalog.Namespace, Name: pvcName}, pvc)
+	err := r.Get(ctx, client.ObjectKey{Namespace: catalog.Namespace, Name: pvcName}, pvc)
 	if err != nil && !errors.IsNotFound(err) {
 		return ctrl.Result{}, fmt.Errorf("failed to get PVC: %w", err)
 	}
@@ -220,7 +157,7 @@ func (r *DuckLakeCatalogReconciler) handleDeletion(ctx context.Context, catalog 
 		return ctrl.Result{}, fmt.Errorf("failed to remove finalizer: %w", err)
 	}
 
-	logger.Info("handled DuckLakeCatalog deletion successfully")
+	l.Info().Msg("handled DuckLakeCatalog deletion successfully")
 	return ctrl.Result{}, nil
 }
 
@@ -263,48 +200,49 @@ func (r *DuckLakeCatalogReconciler) reconcilePVC(ctx context.Context, catalog *d
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *DuckLakeCatalogReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	// Initialize with default pod template
-	r.PodTemplate = config.DefaultPodTemplateConfig()
+	// Initialize logger
+	r.Logger = &zerolog.Logger{}
+	*r.Logger = zerolog.New(zerolog.ConsoleWriter{
+		Out:        os.Stdout,
+		TimeFormat: time.RFC3339Nano,
+	}).With().Timestamp().Logger()
+
+	// Initialize retry config
+	r.RetryConfig = retry.DefaultRetryConfig
+
+	// Initialize S3 client
+	s3Client := awss3.NewFromConfig(aws.Config{
+		Region: "us-east-1", // Default region, will be overridden by endpoint resolver
+		EndpointResolverWithOptions: aws.EndpointResolverWithOptionsFunc(func(service, region string, options ...interface{}) (aws.Endpoint, error) {
+			return aws.Endpoint{
+				URL:               "http://minio:9000", // Default MinIO endpoint
+				SigningRegion:     "us-east-1",
+				HostnameImmutable: true,
+			}, nil
+		}),
+		Credentials: credentials.NewStaticCredentialsProvider(
+			"minioadmin", // Default MinIO access key
+			"minioadmin", // Default MinIO secret key
+			"",
+		),
+	})
+
+	// Initialize backup manager
+	r.Backup = backup.NewBackupManager(r.Client, s3Client, r.Logger)
+	if err := r.Backup.Start(context.Background()); err != nil {
+		return fmt.Errorf("failed to start backup manager: %w", err)
+	}
+
+	// Add cleanup on shutdown
+	if err := mgr.Add(manager.RunnableFunc(func(ctx context.Context) error {
+		<-ctx.Done()
+		r.Backup.Stop()
+		return nil
+	})); err != nil {
+		return fmt.Errorf("failed to add backup manager cleanup: %w", err)
+	}
 
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&ducklakev1alpha1.DuckLakeCatalog{}).
-		Owns(&batchv1.CronJob{}).
-		// Watch ConfigMaps for pod template updates
-		Watches(
-			&corev1.ConfigMap{},
-			handler.EnqueueRequestsFromMapFunc(r.findCatalogsForConfigMap),
-		).
 		Complete(r)
-}
-
-// findCatalogsForConfigMap maps ConfigMap changes to DuckLakeCatalog reconcile requests
-func (r *DuckLakeCatalogReconciler) findCatalogsForConfigMap(ctx context.Context, obj client.Object) []ctrl.Request {
-	configMap := obj.(*corev1.ConfigMap)
-	if configMap.Name != "ducklake-pod-template" {
-		return nil
-	}
-
-	// Load new pod template configuration
-	if data, ok := configMap.Data["config"]; ok {
-		if newTemplate, err := config.LoadFromConfigMap(data); err == nil {
-			r.PodTemplate = newTemplate
-		}
-	}
-
-	// List all DuckLakeCatalogs
-	var catalogs ducklakev1alpha1.DuckLakeCatalogList
-	if err := r.List(ctx, &catalogs); err != nil {
-		return nil
-	}
-
-	var requests []ctrl.Request
-	for _, catalog := range catalogs.Items {
-		requests = append(requests, ctrl.Request{
-			NamespacedName: client.ObjectKey{
-				Name:      catalog.Name,
-				Namespace: catalog.Namespace,
-			},
-		})
-	}
-	return requests
 }
