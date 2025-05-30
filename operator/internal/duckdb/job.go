@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/TFMV/featherman/operator/internal/config"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -28,6 +29,8 @@ type JobConfig struct {
 	ReadOnly bool
 	// OwnerReference for the job
 	OwnerReference *metav1.OwnerReference
+	// PodTemplate defines custom pod configuration
+	PodTemplate *config.PodTemplateConfig
 }
 
 // ObjectStoreConfig contains S3-compatible storage configuration
@@ -168,6 +171,11 @@ func CreateJobSpec(config JobConfig) (*batchv1.Job, error) {
 				},
 			},
 		},
+	}
+
+	// Apply pod template configuration if provided
+	if config.PodTemplate != nil {
+		config.PodTemplate.ApplyToPodSpec(&job.Spec.Template.Spec)
 	}
 
 	return job, nil
