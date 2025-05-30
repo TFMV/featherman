@@ -98,3 +98,96 @@ func TransactionSQL(statements ...string) string {
 	buf.WriteString("COMMIT;")
 	return buf.String()
 }
+
+// GenerateTableSQL generates SQL for table creation
+func (g *Generator) GenerateTableSQL(table *ducklakev1alpha1.DuckLakeTable) (string, error) {
+	var sb strings.Builder
+
+	// Begin transaction
+	sb.WriteString("BEGIN TRANSACTION;\n\n")
+
+	// Create table
+	sb.WriteString(fmt.Sprintf("CREATE TABLE IF NOT EXISTS %s (\n", table.Spec.Name))
+
+	// Add columns
+	for i, col := range table.Spec.Columns {
+		sb.WriteString(fmt.Sprintf("  %s %s", col.Name, col.Type))
+		if !col.Nullable {
+			sb.WriteString(" NOT NULL")
+		}
+		if col.Comment != "" {
+			sb.WriteString(fmt.Sprintf(" COMMENT '%s'", strings.ReplaceAll(col.Comment, "'", "''")))
+		}
+		if i < len(table.Spec.Columns)-1 {
+			sb.WriteString(",")
+		}
+		sb.WriteString("\n")
+	}
+	sb.WriteString(")")
+
+	// Add table comment
+	if table.Spec.Comment != "" {
+		sb.WriteString(fmt.Sprintf(" COMMENT '%s'", strings.ReplaceAll(table.Spec.Comment, "'", "''")))
+	}
+	sb.WriteString(";\n\n")
+
+	// Configure Parquet settings
+	sb.WriteString(fmt.Sprintf("COPY %s TO 's3://%s/%s' (\n", table.Spec.Name, table.Spec.ObjectStore.Bucket, table.Spec.Location))
+	sb.WriteString(fmt.Sprintf("  FORMAT 'parquet',\n"))
+	sb.WriteString(fmt.Sprintf("  COMPRESSION '%s'", table.Spec.Format.Compression))
+
+	// Add partitioning
+	if len(table.Spec.Format.Partitioning) > 0 {
+		sb.WriteString(",\n  PARTITION_BY (")
+		for i, col := range table.Spec.Format.Partitioning {
+			if i > 0 {
+				sb.WriteString(", ")
+			}
+			sb.WriteString(col)
+		}
+		sb.WriteString(")")
+	}
+	sb.WriteString("\n);\n\n")
+
+	// Commit transaction
+	sb.WriteString("COMMIT;")
+
+	return sb.String(), nil
+}
+
+// GenerateInsertSQL generates SQL for data insertion
+func (g *Generator) GenerateInsertSQL(table *ducklakev1alpha1.DuckLakeTable, data string) (string, error) {
+	var sb strings.Builder
+
+	// Begin transaction
+	sb.WriteString("BEGIN TRANSACTION;\n\n")
+
+	// Insert data
+	if table.Spec.Mode == ducklakev1alpha1.TableModeOverwrite {
+		sb.WriteString(fmt.Sprintf("TRUNCATE TABLE %s;\n\n", table.Spec.Name))
+	}
+
+	sb.WriteString(fmt.Sprintf("COPY %s FROM '%s';\n\n", table.Spec.Name, data))
+
+	// Commit transaction
+	sb.WriteString("COMMIT;")
+
+	return sb.String(), nil
+}
+
+// GenerateQuerySQL generates SQL for data querying
+func (g *Generator) GenerateQuerySQL(table *ducklakev1alpha1.DuckLakeTable, query string) (string, error) {
+	var sb strings.Builder
+
+	// Begin transaction
+	sb.WriteString("BEGIN TRANSACTION;\n\n")
+
+	// Execute query
+	sb.WriteString(query)
+	sb.WriteString(";\n\n")
+
+	// Commit transaction
+	sb.WriteString("COMMIT;")
+
+	return sb.String(), nil
+}
