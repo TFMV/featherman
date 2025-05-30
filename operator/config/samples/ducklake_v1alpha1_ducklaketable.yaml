@@ -1,0 +1,9 @@
+apiVersion: ducklake.featherman.dev/v1alpha1
+kind: DuckLakeTable
+metadata:
+  labels:
+    app.kubernetes.io/name: featherman
+    app.kubernetes.io/managed-by: kustomize
+  name: ducklaketable-sample
+spec:
+  # TODO(user): Add fields here
