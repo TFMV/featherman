@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"path"
+	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -18,6 +19,7 @@ import (
 
 	ducklakev1alpha1 "github.com/TFMV/featherman/operator/api/v1alpha1"
 	"github.com/TFMV/featherman/operator/internal/duckdb"
+	"github.com/TFMV/featherman/operator/internal/metrics"
 	"github.com/TFMV/featherman/operator/internal/sql"
 )
 
@@ -42,12 +44,18 @@ func (r *DuckLakeTableReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	logger := log.FromContext(ctx)
 	logger.Info("reconciling DuckLakeTable", "namespacedName", req.NamespacedName)
 
+	startTime := time.Now()
+	defer func() {
+		metrics.RecordJobDuration("reconcile", "completed", time.Since(startTime).Seconds())
+	}()
+
 	// Get the DuckLakeTable instance
 	table := &ducklakev1alpha1.DuckLakeTable{}
 	if err := r.Get(ctx, req.NamespacedName, table); err != nil {
 		if errors.IsNotFound(err) {
 			return ctrl.Result{}, nil
 		}
+		metrics.RecordTableOperation("get", "failed")
 		return ctrl.Result{}, fmt.Errorf("failed to get DuckLakeTable: %w", err)
 	}
 
@@ -55,27 +63,39 @@ func (r *DuckLakeTableReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	if table.Status.Phase == "" {
 		table.Status.Phase = ducklakev1alpha1.TablePhasePending
 		if err := r.Status().Update(ctx, table); err != nil {
+			metrics.RecordTableOperation("status_update", "failed")
 			return ctrl.Result{}, fmt.Errorf("failed to update status: %w", err)
 		}
+		metrics.RecordTableOperation("status_update", "succeeded")
 	}
 
 	// Add finalizer
 	if !controllerutil.ContainsFinalizer(table, "ducklaketable.featherman.dev") {
 		controllerutil.AddFinalizer(table, "ducklaketable.featherman.dev")
 		if err := r.Update(ctx, table); err != nil {
+			metrics.RecordTableOperation("add_finalizer", "failed")
 			return ctrl.Result{}, fmt.Errorf("failed to add finalizer: %w", err)
 		}
+		metrics.RecordTableOperation("add_finalizer", "succeeded")
 	}
 
 	// Handle deletion
 	if !table.DeletionTimestamp.IsZero() {
-		return r.handleDeletion(ctx, table)
+		metrics.RecordTableOperation("delete", "started")
+		result, err := r.handleDeletion(ctx, table)
+		if err != nil {
+			metrics.RecordTableOperation("delete", "failed")
+			return result, err
+		}
+		metrics.RecordTableOperation("delete", "succeeded")
+		return result, nil
 	}
 
 	// Generate SQL for table creation
 	createSQL, err := r.SQLGen.CreateTableSQL(table)
 	if err != nil {
 		table.Status.Phase = ducklakev1alpha1.TablePhaseFailed
+		metrics.RecordTableOperation("generate_sql", "failed")
 		r.Recorder.Event(table, corev1.EventTypeWarning, "SQLGenerationFailed", err.Error())
 		return ctrl.Result{}, fmt.Errorf("failed to generate create table SQL: %w", err)
 	}
@@ -84,6 +104,7 @@ func (r *DuckLakeTableReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	attachSQL, err := r.SQLGen.AttachParquetSQL(table, table.Spec.Location)
 	if err != nil {
 		table.Status.Phase = ducklakev1alpha1.TablePhaseFailed
+		metrics.RecordTableOperation("generate_sql", "failed")
 		r.Recorder.Event(table, corev1.EventTypeWarning, "SQLGenerationFailed", err.Error())
 		return ctrl.Result{}, fmt.Errorf("failed to generate attach SQL: %w", err)
 	}
@@ -104,26 +125,38 @@ func (r *DuckLakeTableReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	job, err := r.JobManager.CreateJob(ctx, jobConfig)
 	if err != nil {
 		table.Status.Phase = ducklakev1alpha1.TablePhaseFailed
+		metrics.RecordTableOperation("create_job", "failed")
 		r.Recorder.Event(table, corev1.EventTypeWarning, "JobCreationFailed", err.Error())
 		return ctrl.Result{}, fmt.Errorf("failed to create job: %w", err)
 	}
+	metrics.RecordTableOperation("create_job", "succeeded")
 
 	// Check job status
 	if duckdb.IsJobComplete(job) {
 		table.Status.Phase = ducklakev1alpha1.TablePhaseSucceeded
 		table.Status.LastModified = &metav1.Time{Time: job.Status.CompletionTime.Time}
 		table.Status.ObservedGeneration = table.Generation
+
+		// Update metrics
+		if len(table.Spec.Format.Partitioning) > 0 {
+			metrics.UpdateTablePartitionCount(table.Name, float64(len(table.Spec.Format.Partitioning)))
+		}
+
 		r.Recorder.Event(table, corev1.EventTypeNormal, "TableCreated", "Table created successfully")
+		metrics.RecordTableOperation("reconcile", "succeeded")
 	} else if duckdb.IsJobFailed(job) {
 		table.Status.Phase = ducklakev1alpha1.TablePhaseFailed
 		r.Recorder.Event(table, corev1.EventTypeWarning, "TableCreationFailed", "Job failed")
+		metrics.RecordTableOperation("reconcile", "failed")
 		return ctrl.Result{}, fmt.Errorf("job failed")
 	}
 
 	// Update status
 	if err := r.Status().Update(ctx, table); err != nil {
+		metrics.RecordTableOperation("status_update", "failed")
 		return ctrl.Result{}, fmt.Errorf("failed to update status: %w", err)
 	}
+	metrics.RecordTableOperation("status_update", "succeeded")
 
 	logger.Info("reconciled DuckLakeTable successfully")
 	return ctrl.Result{}, nil
