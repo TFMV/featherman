@@ -24,6 +24,8 @@ import (
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 	// to ensure that exec-entrypoint and run can make use of them.
+
+	"k8s.io/client-go/kubernetes"
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 
 	"k8s.io/apimachinery/pkg/runtime"
@@ -37,8 +39,10 @@ import (
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 
-	ducklakev1alpha1 "github.com/TFMV/featherman/api/v1alpha1"
-	"github.com/TFMV/featherman/internal/controller"
+	ducklakev1alpha1 "github.com/TFMV/featherman/operator/api/v1alpha1"
+	"github.com/TFMV/featherman/operator/internal/controller"
+	"github.com/TFMV/featherman/operator/internal/duckdb"
+	"github.com/TFMV/featherman/operator/internal/sql"
 	// +kubebuilder:scaffold:imports
 )
 
@@ -64,8 +68,7 @@ func main() {
 	var secureMetrics bool
 	var enableHTTP2 bool
 	var tlsOpts []func(*tls.Config)
-	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
-		"Use :8443 for HTTPS or :8080 for HTTP, or leave as 0 to disable the metrics service.")
+	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "The address the metric endpoint binds to.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
 	flag.BoolVar(&enableLeaderElection, "leader-elect", false,
 		"Enable leader election for controller manager. "+
@@ -184,7 +187,7 @@ func main() {
 		WebhookServer:          webhookServer,
 		HealthProbeBindAddress: probeAddr,
 		LeaderElection:         enableLeaderElection,
-		LeaderElectionID:       "d6551a29.featherman.dev",
+		LeaderElectionID:       "featherman-operator-lock",
 		// LeaderElectionReleaseOnCancel defines if the leader should step down voluntarily
 		// when the Manager ends. This requires the binary to immediately end when the
 		// Manager is stopped, otherwise, this setting is unsafe. Setting this significantly
@@ -202,16 +205,31 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Create JobManager
+	k8sClient, err := kubernetes.NewForConfig(mgr.GetConfig())
+	if err != nil {
+		setupLog.Error(err, "unable to create kubernetes client")
+		os.Exit(1)
+	}
+	jobManager := duckdb.NewJobManager(k8sClient)
+
+	// Create SQL Generator
+	sqlGen := sql.NewGenerator()
+
 	if err := (&controller.DuckLakeCatalogReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
+		Client:   mgr.GetClient(),
+		Scheme:   mgr.GetScheme(),
+		Recorder: mgr.GetEventRecorderFor("ducklakecatalog-controller"),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "DuckLakeCatalog")
 		os.Exit(1)
 	}
 	if err := (&controller.DuckLakeTableReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
+		Client:     mgr.GetClient(),
+		Scheme:     mgr.GetScheme(),
+		Recorder:   mgr.GetEventRecorderFor("ducklaketable-controller"),
+		JobManager: jobManager,
+		SQLGen:     sqlGen,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "DuckLakeTable")
 		os.Exit(1)
