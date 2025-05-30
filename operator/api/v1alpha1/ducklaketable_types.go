@@ -23,17 +23,71 @@ import (
 // EDIT THIS FILE!  THIS IS SCAFFOLDING FOR YOU TO OWN!
 // NOTE: json tags are required.  Any new fields you add must have json tags for the fields to be serialized.
 
+// TablePhase represents the phase of a DuckLakeTable
+type TablePhase string
+
+const (
+	// TablePhasePending indicates the table is being created
+	TablePhasePending TablePhase = "Pending"
+	// TablePhaseSucceeded indicates the table is ready
+	TablePhaseSucceeded TablePhase = "Succeeded"
+	// TablePhaseFailed indicates the table failed to create
+	TablePhaseFailed TablePhase = "Failed"
+)
+
+// SQLType represents a SQL data type
+type SQLType string
+
+const (
+	// SQLTypeInteger represents INTEGER type
+	SQLTypeInteger SQLType = "INTEGER"
+	// SQLTypeBigInt represents BIGINT type
+	SQLTypeBigInt SQLType = "BIGINT"
+	// SQLTypeDouble represents DOUBLE type
+	SQLTypeDouble SQLType = "DOUBLE"
+	// SQLTypeBoolean represents BOOLEAN type
+	SQLTypeBoolean SQLType = "BOOLEAN"
+	// SQLTypeVarChar represents VARCHAR type
+	SQLTypeVarChar SQLType = "VARCHAR"
+	// SQLTypeDate represents DATE type
+	SQLTypeDate SQLType = "DATE"
+	// SQLTypeTimestamp represents TIMESTAMP type
+	SQLTypeTimestamp SQLType = "TIMESTAMP"
+	// SQLTypeDecimal represents DECIMAL type
+	SQLTypeDecimal SQLType = "DECIMAL"
+)
+
+// CompressionType represents a Parquet compression type
+type CompressionType string
+
+const (
+	// CompressionZSTD represents ZSTD compression
+	CompressionZSTD CompressionType = "ZSTD"
+	// CompressionSnappy represents Snappy compression
+	CompressionSnappy CompressionType = "SNAPPY"
+)
+
+// TableMode represents the table write mode
+type TableMode string
+
+const (
+	// TableModeAppend represents append mode
+	TableModeAppend TableMode = "append"
+	// TableModeOverwrite represents overwrite mode
+	TableModeOverwrite TableMode = "overwrite"
+)
+
 // ColumnDefinition defines a column in the table
 type ColumnDefinition struct {
-	// Name of the column
+	// Name is the column name
 	// +kubebuilder:validation:Required
-	// +kubebuilder:validation:Pattern=[a-zA-Z][a-zA-Z0-9_]*
+	// +kubebuilder:validation:Pattern=^[a-zA-Z][a-zA-Z0-9_]*$
 	Name string `json:"name"`
 
-	// Type is the SQL data type of the column
+	// Type is the SQL data type
 	// +kubebuilder:validation:Required
 	// +kubebuilder:validation:Enum=INTEGER;BIGINT;DOUBLE;BOOLEAN;VARCHAR;DATE;TIMESTAMP;DECIMAL
-	Type string `json:"type"`
+	Type SQLType `json:"type"`
 
 	// Nullable specifies if the column can contain NULL values
 	// +optional
@@ -46,102 +100,83 @@ type ColumnDefinition struct {
 
 // ParquetFormat defines the Parquet file format configuration
 type ParquetFormat struct {
-	// Compression algorithm to use
-	// +kubebuilder:validation:Enum=SNAPPY;ZSTD;NONE
-	// +optional
-	Compression string `json:"compression,omitempty"`
+	// Compression specifies the compression algorithm
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:Enum=ZSTD;SNAPPY
+	Compression CompressionType `json:"compression"`
 
-	// RowGroupSize specifies the size of row groups in bytes
+	// Partitioning specifies the partition columns
 	// +optional
-	// +kubebuilder:validation:Minimum=1048576
-	RowGroupSize int64 `json:"rowGroupSize,omitempty"`
+	Partitioning []string `json:"partitioning,omitempty"`
 }
 
 // DuckLakeTableSpec defines the desired state of DuckLakeTable
 type DuckLakeTableSpec struct {
-	// CatalogRef references the DuckLakeCatalog this table belongs to
+	// Name is the table name
 	// +kubebuilder:validation:Required
-	CatalogRef string `json:"catalogRef"`
-
-	// Name is the name of the table
-	// +kubebuilder:validation:Required
-	// +kubebuilder:validation:Pattern=[a-zA-Z][a-zA-Z0-9_]*
+	// +kubebuilder:validation:Pattern=^[a-zA-Z][a-zA-Z0-9_]*$
 	Name string `json:"name"`
 
-	// Columns defines the schema of the table
+	// Columns defines the table columns
 	// +kubebuilder:validation:Required
 	// +kubebuilder:validation:MinItems=1
 	Columns []ColumnDefinition `json:"columns"`
 
-	// Partitioning defines the partition columns
-	// +optional
-	Partitioning []string `json:"partitioning,omitempty"`
-
 	// Format specifies the Parquet format configuration
-	// +optional
-	Format *ParquetFormat `json:"format,omitempty"`
+	// +kubebuilder:validation:Required
+	Format ParquetFormat `json:"format"`
 
-	// TTLDays specifies the number of days to retain data
+	// Location is the object store path for Parquet files
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:Pattern=^[a-zA-Z0-9-_./]+$
+	Location string `json:"location"`
+
+	// TTLDays specifies the data retention period in days
 	// +optional
 	// +kubebuilder:validation:Minimum=1
-	TTLDays *int32 `json:"ttlDays,omitempty"`
+	TTLDays *int `json:"ttlDays,omitempty"`
 
-	// Mode specifies how to handle existing data
+	// Mode specifies the table write mode
+	// +kubebuilder:validation:Required
 	// +kubebuilder:validation:Enum=append;overwrite
-	// +optional
-	Mode string `json:"mode,omitempty"`
+	Mode TableMode `json:"mode"`
 
 	// Comment provides documentation for the table
 	// +optional
 	Comment string `json:"comment,omitempty"`
 }
 
-// TablePhase represents the current phase of the table
-// +kubebuilder:validation:Enum=Pending;Creating;Ready;Failed
-type TablePhase string
-
-const (
-	// TablePhasePending means the table is being initialized
-	TablePhasePending TablePhase = "Pending"
-	// TablePhaseCreating means the table is being created
-	TablePhaseCreating TablePhase = "Creating"
-	// TablePhaseReady means the table is ready for use
-	TablePhaseReady TablePhase = "Ready"
-	// TablePhaseFailed means the table creation failed
-	TablePhaseFailed TablePhase = "Failed"
-)
-
 // DuckLakeTableStatus defines the observed state of DuckLakeTable
 type DuckLakeTableStatus struct {
-	// Phase represents the current phase of the table
-	// +optional
+	// Phase is the current phase of the table
+	// +kubebuilder:validation:Enum=Pending;Succeeded;Failed
 	Phase TablePhase `json:"phase,omitempty"`
 
-	// LastAppliedSnapshot is the ID of the last successful snapshot
+	// LastAppliedSnapshot is the latest successful snapshot ID
 	// +optional
 	LastAppliedSnapshot string `json:"lastAppliedSnapshot,omitempty"`
 
-	// BytesWritten is the total bytes written to this table
+	// BytesWritten is the total bytes written
 	// +optional
 	BytesWritten int64 `json:"bytesWritten,omitempty"`
 
-	// LastModified is when the table was last modified
+	// LastModified is the last modification timestamp
 	// +optional
 	LastModified *metav1.Time `json:"lastModified,omitempty"`
-
-	// Conditions represent the latest available observations of the table's state
-	// +optional
-	Conditions []metav1.Condition `json:"conditions,omitempty"`
 
 	// ObservedGeneration is the last generation that was acted on
 	// +optional
 	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
+
+	// Conditions represent the latest available observations of the table's state
+	// +optional
+	Conditions []metav1.Condition `json:"conditions,omitempty"`
 }
 
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
 // +kubebuilder:printcolumn:name="Phase",type="string",JSONPath=".status.phase"
-// +kubebuilder:printcolumn:name="Catalog",type="string",JSONPath=".spec.catalogRef"
+// +kubebuilder:printcolumn:name="Mode",type="string",JSONPath=".spec.mode"
 // +kubebuilder:printcolumn:name="Age",type="date",JSONPath=".metadata.creationTimestamp"
 
 // DuckLakeTable is the Schema for the ducklaketables API

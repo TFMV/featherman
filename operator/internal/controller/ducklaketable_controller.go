@@ -1,56 +1,173 @@
-/*
-Copyright 2025 Thomas McGeehan.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
-
 package controller
 
 import (
 	"context"
+	"fmt"
+	"path"
 
+	batchv1 "k8s.io/api/batch/v1"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 
-	ducklakev1alpha1 "github.com/TFMV/featherman/api/v1alpha1"
+	ducklakev1alpha1 "github.com/TFMV/featherman/operator/api/v1alpha1"
+	"github.com/TFMV/featherman/operator/internal/duckdb"
+	"github.com/TFMV/featherman/operator/internal/sql"
 )
 
 // DuckLakeTableReconciler reconciles a DuckLakeTable object
 type DuckLakeTableReconciler struct {
 	client.Client
-	Scheme *runtime.Scheme
+	Scheme     *runtime.Scheme
+	Recorder   record.EventRecorder
+	JobManager duckdb.JobManager
+	SQLGen     *sql.Generator
 }
 
 // +kubebuilder:rbac:groups=ducklake.featherman.dev,resources=ducklaketables,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=ducklake.featherman.dev,resources=ducklaketables/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=ducklake.featherman.dev,resources=ducklaketables/finalizers,verbs=update
+// +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=core,resources=secrets,verbs=get;list;watch
+// +kubebuilder:rbac:groups=core,resources=events,verbs=create;patch
 
-// Reconcile is part of the main kubernetes reconciliation loop which aims to
-// move the current state of the cluster closer to the desired state.
-// TODO(user): Modify the Reconcile function to compare the state specified by
-// the DuckLakeTable object against the actual cluster state, and then
-// perform operations to make the cluster state reflect the state specified by
-// the user.
-//
-// For more details, check Reconcile and its Result here:
-// - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.21.0/pkg/reconcile
+// Reconcile handles DuckLakeTable resources
 func (r *DuckLakeTableReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	_ = logf.FromContext(ctx)
+	logger := log.FromContext(ctx)
+	logger.Info("reconciling DuckLakeTable", "namespacedName", req.NamespacedName)
 
-	// TODO(user): your logic here
+	// Get the DuckLakeTable instance
+	table := &ducklakev1alpha1.DuckLakeTable{}
+	if err := r.Get(ctx, req.NamespacedName, table); err != nil {
+		if errors.IsNotFound(err) {
+			return ctrl.Result{}, nil
+		}
+		return ctrl.Result{}, fmt.Errorf("failed to get DuckLakeTable: %w", err)
+	}
 
+	// Initialize status if needed
+	if table.Status.Phase == "" {
+		table.Status.Phase = ducklakev1alpha1.TablePhasePending
+		if err := r.Status().Update(ctx, table); err != nil {
+			return ctrl.Result{}, fmt.Errorf("failed to update status: %w", err)
+		}
+	}
+
+	// Add finalizer
+	if !controllerutil.ContainsFinalizer(table, "ducklaketable.featherman.dev") {
+		controllerutil.AddFinalizer(table, "ducklaketable.featherman.dev")
+		if err := r.Update(ctx, table); err != nil {
+			return ctrl.Result{}, fmt.Errorf("failed to add finalizer: %w", err)
+		}
+	}
+
+	// Handle deletion
+	if !table.DeletionTimestamp.IsZero() {
+		return r.handleDeletion(ctx, table)
+	}
+
+	// Generate SQL for table creation
+	createSQL, err := r.SQLGen.CreateTableSQL(table)
+	if err != nil {
+		table.Status.Phase = ducklakev1alpha1.TablePhaseFailed
+		r.Recorder.Event(table, corev1.EventTypeWarning, "SQLGenerationFailed", err.Error())
+		return ctrl.Result{}, fmt.Errorf("failed to generate create table SQL: %w", err)
+	}
+
+	// Generate SQL for attaching Parquet files
+	attachSQL, err := r.SQLGen.AttachParquetSQL(table, table.Spec.Location)
+	if err != nil {
+		table.Status.Phase = ducklakev1alpha1.TablePhaseFailed
+		r.Recorder.Event(table, corev1.EventTypeWarning, "SQLGenerationFailed", err.Error())
+		return ctrl.Result{}, fmt.Errorf("failed to generate attach SQL: %w", err)
+	}
+
+	// Create DuckDB job
+	jobConfig := duckdb.JobConfig{
+		Name:        fmt.Sprintf("%s-table-create", table.Name),
+		Namespace:   table.Namespace,
+		SQL:         sql.TransactionSQL(createSQL, attachSQL),
+		CatalogPath: path.Join("/catalog", "catalog.db"),
+		ReadOnly:    false,
+	}
+
+	// Set owner reference
+	jobConfig.OwnerReference = metav1.NewControllerRef(table, ducklakev1alpha1.GroupVersion.WithKind("DuckLakeTable"))
+
+	// Create the job
+	job, err := r.JobManager.CreateJob(ctx, jobConfig)
+	if err != nil {
+		table.Status.Phase = ducklakev1alpha1.TablePhaseFailed
+		r.Recorder.Event(table, corev1.EventTypeWarning, "JobCreationFailed", err.Error())
+		return ctrl.Result{}, fmt.Errorf("failed to create job: %w", err)
+	}
+
+	// Check job status
+	if duckdb.IsJobComplete(job) {
+		table.Status.Phase = ducklakev1alpha1.TablePhaseSucceeded
+		table.Status.LastModified = &metav1.Time{Time: job.Status.CompletionTime.Time}
+		table.Status.ObservedGeneration = table.Generation
+		r.Recorder.Event(table, corev1.EventTypeNormal, "TableCreated", "Table created successfully")
+	} else if duckdb.IsJobFailed(job) {
+		table.Status.Phase = ducklakev1alpha1.TablePhaseFailed
+		r.Recorder.Event(table, corev1.EventTypeWarning, "TableCreationFailed", "Job failed")
+		return ctrl.Result{}, fmt.Errorf("job failed")
+	}
+
+	// Update status
+	if err := r.Status().Update(ctx, table); err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed to update status: %w", err)
+	}
+
+	logger.Info("reconciled DuckLakeTable successfully")
+	return ctrl.Result{}, nil
+}
+
+// handleDeletion handles the deletion of a DuckLakeTable
+func (r *DuckLakeTableReconciler) handleDeletion(ctx context.Context, table *ducklakev1alpha1.DuckLakeTable) (ctrl.Result, error) {
+	logger := log.FromContext(ctx)
+	logger.Info("handling DuckLakeTable deletion")
+
+	// Generate SQL for dropping table
+	dropSQL := fmt.Sprintf("DROP TABLE IF EXISTS %s;", table.Spec.Name)
+
+	// Create DuckDB job for cleanup
+	jobConfig := duckdb.JobConfig{
+		Name:        fmt.Sprintf("%s-table-drop", table.Name),
+		Namespace:   table.Namespace,
+		SQL:         dropSQL,
+		CatalogPath: path.Join("/catalog", "catalog.db"),
+		ReadOnly:    false,
+	}
+
+	// Set owner reference
+	jobConfig.OwnerReference = metav1.NewControllerRef(table, ducklakev1alpha1.GroupVersion.WithKind("DuckLakeTable"))
+
+	// Create the job
+	job, err := r.JobManager.CreateJob(ctx, jobConfig)
+	if err != nil {
+		r.Recorder.Event(table, corev1.EventTypeWarning, "CleanupFailed", err.Error())
+		return ctrl.Result{}, fmt.Errorf("failed to create cleanup job: %w", err)
+	}
+
+	// Wait for job completion
+	if !duckdb.IsJobComplete(job) && !duckdb.IsJobFailed(job) {
+		return ctrl.Result{Requeue: true}, nil
+	}
+
+	// Remove finalizer
+	controllerutil.RemoveFinalizer(table, "ducklaketable.featherman.dev")
+	if err := r.Update(ctx, table); err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed to remove finalizer: %w", err)
+	}
+
+	logger.Info("handled DuckLakeTable deletion successfully")
 	return ctrl.Result{}, nil
 }
 
@@ -58,6 +175,6 @@ func (r *DuckLakeTableReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 func (r *DuckLakeTableReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&ducklakev1alpha1.DuckLakeTable{}).
-		Named("ducklaketable").
+		Owns(&batchv1.Job{}).
 		Complete(r)
 }
