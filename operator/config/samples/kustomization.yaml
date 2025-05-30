@@ -1,0 +1,5 @@
+## Append samples of your project ##
+resources:
+- ducklake_v1alpha1_ducklakecatalog.yaml
+- ducklake_v1alpha1_ducklaketable.yaml
+# +kubebuilder:scaffold:manifestskustomizesamples
