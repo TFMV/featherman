@@ -144,6 +144,15 @@ type DuckLakeTableSpec struct {
 	// Comment provides documentation for the table
 	// +optional
 	Comment string `json:"comment,omitempty"`
+
+	// CatalogRef references the DuckLakeCatalog this table belongs to
+	// +kubebuilder:validation:Required
+	CatalogRef string `json:"catalogRef"`
+
+	// ObjectStore defines the S3-compatible storage configuration
+	// If not specified, the configuration from the referenced catalog will be used
+	// +optional
+	ObjectStore *ObjectStoreSpec `json:"objectStore,omitempty"`
 }
 
 // DuckLakeTableStatus defines the observed state of DuckLakeTable
