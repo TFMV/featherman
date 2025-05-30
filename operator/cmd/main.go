@@ -17,7 +17,6 @@ limitations under the License.
 package main
 
 import (
-	"context"
 	"crypto/tls"
 	"flag"
 	"os"
@@ -28,7 +27,8 @@ import (
 	"github.com/TFMV/featherman/operator/internal/duckdb"
 	"github.com/TFMV/featherman/operator/internal/health"
 	"github.com/TFMV/featherman/operator/internal/sql"
-	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
@@ -220,49 +220,19 @@ func main() {
 	// Create SQL Generator
 	sqlGen := sql.NewGenerator()
 
-	if err := (&controller.DuckLakeCatalogReconciler{
-		Client:   mgr.GetClient(),
-		Scheme:   mgr.GetScheme(),
-		Recorder: mgr.GetEventRecorderFor("ducklakecatalog-controller"),
-	}).SetupWithManager(mgr); err != nil {
-		setupLog.Error(err, "unable to create controller", "controller", "DuckLakeCatalog")
-		os.Exit(1)
-	}
-	if err := (&controller.DuckLakeTableReconciler{
-		Client:     mgr.GetClient(),
-		Scheme:     mgr.GetScheme(),
-		Recorder:   mgr.GetEventRecorderFor("ducklaketable-controller"),
-		JobManager: jobManager,
-		SQLGen:     sqlGen,
-	}).SetupWithManager(mgr); err != nil {
-		setupLog.Error(err, "unable to create controller", "controller", "DuckLakeTable")
-		os.Exit(1)
-	}
-	// +kubebuilder:scaffold:builder
-
-	if metricsCertWatcher != nil {
-		setupLog.Info("Adding metrics certificate watcher to manager")
-		if err := mgr.Add(metricsCertWatcher); err != nil {
-			setupLog.Error(err, "unable to add metrics certificate watcher to manager")
-			os.Exit(1)
-		}
-	}
-
-	if webhookCertWatcher != nil {
-		setupLog.Info("Adding webhook certificate watcher to manager")
-		if err := mgr.Add(webhookCertWatcher); err != nil {
-			setupLog.Error(err, "unable to add webhook certificate watcher to manager")
-			os.Exit(1)
-		}
-	}
-
 	// Create S3 client for health checks
-	cfg, err := config.LoadDefaultConfig(context.Background())
-	if err != nil {
-		setupLog.Error(err, "unable to load AWS SDK config")
-		os.Exit(1)
-	}
-	s3Client := s3.NewFromConfig(cfg)
+	customEndpoint := "http://minio.minio-test.svc.cluster.local:9000"
+	s3Client := s3.NewFromConfig(aws.Config{
+		Region: "us-east-1",
+		Credentials: credentials.NewStaticCredentialsProvider(
+			"minioadmin", // Default MinIO access key
+			"minioadmin", // Default MinIO secret key
+			"",
+		),
+	}, func(o *s3.Options) {
+		o.BaseEndpoint = &customEndpoint
+		o.UsePathStyle = true
+	})
 
 	// Add health checks
 	if err := mgr.AddHealthzCheck("s3", health.S3Check(s3Client)); err != nil {
@@ -303,6 +273,47 @@ func main() {
 	if len(webhookCertPath) > 0 {
 		if err := mgr.AddHealthzCheck("webhook", health.WebhookCertCheck(webhookCertPath)); err != nil {
 			setupLog.Error(err, "unable to set up webhook certificate health check")
+			os.Exit(1)
+		}
+	}
+
+	// Initialize controllers
+	catalogReconciler := &controller.DuckLakeCatalogReconciler{
+		Client:   mgr.GetClient(),
+		Scheme:   mgr.GetScheme(),
+		Recorder: mgr.GetEventRecorderFor("ducklakecatalog-controller"),
+	}
+
+	tableReconciler := &controller.DuckLakeTableReconciler{
+		Client:     mgr.GetClient(),
+		Scheme:     mgr.GetScheme(),
+		Recorder:   mgr.GetEventRecorderFor("ducklaketable-controller"),
+		JobManager: jobManager,
+		SQLGen:     sqlGen,
+	}
+
+	if err := catalogReconciler.SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "DuckLakeCatalog")
+		os.Exit(1)
+	}
+
+	if err := tableReconciler.SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "DuckLakeTable")
+		os.Exit(1)
+	}
+
+	if metricsCertWatcher != nil {
+		setupLog.Info("Adding metrics certificate watcher to manager")
+		if err := mgr.Add(metricsCertWatcher); err != nil {
+			setupLog.Error(err, "unable to add metrics certificate watcher to manager")
+			os.Exit(1)
+		}
+	}
+
+	if webhookCertWatcher != nil {
+		setupLog.Info("Adding webhook certificate watcher to manager")
+		if err := mgr.Add(webhookCertWatcher); err != nil {
+			setupLog.Error(err, "unable to add webhook certificate watcher to manager")
 			os.Exit(1)
 		}
 	}

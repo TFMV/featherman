@@ -211,30 +211,34 @@ func (r *DuckLakeCatalogReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	r.RetryConfig = retry.DefaultRetryConfig
 
 	// Initialize S3 client
+	customEndpoint := "http://minio.minio-test.svc.cluster.local:9000"
 	s3Client := awss3.NewFromConfig(aws.Config{
-		Region: "us-east-1", // Default region, will be overridden by endpoint resolver
-		EndpointResolverWithOptions: aws.EndpointResolverWithOptionsFunc(func(service, region string, options ...interface{}) (aws.Endpoint, error) {
-			return aws.Endpoint{
-				URL:               "http://minio:9000", // Default MinIO endpoint
-				SigningRegion:     "us-east-1",
-				HostnameImmutable: true,
-			}, nil
-		}),
+		Region: "us-east-1",
 		Credentials: credentials.NewStaticCredentialsProvider(
 			"minioadmin", // Default MinIO access key
 			"minioadmin", // Default MinIO secret key
 			"",
 		),
+	}, func(o *awss3.Options) {
+		o.BaseEndpoint = &customEndpoint
+		o.UsePathStyle = true
 	})
 
 	// Initialize backup manager
 	r.Backup = backup.NewBackupManager(r.Client, s3Client, r.Logger)
-	if err := r.Backup.Start(context.Background()); err != nil {
-		return fmt.Errorf("failed to start backup manager: %w", err)
-	}
 
 	// Add cleanup on shutdown
 	if err := mgr.Add(manager.RunnableFunc(func(ctx context.Context) error {
+		// Wait for cache to be ready
+		if !mgr.GetCache().WaitForCacheSync(ctx) {
+			return fmt.Errorf("failed to wait for caches to sync")
+		}
+
+		// Start backup manager after cache is ready
+		if err := r.Backup.Start(ctx); err != nil {
+			return fmt.Errorf("failed to start backup manager: %w", err)
+		}
+
 		<-ctx.Done()
 		r.Backup.Stop()
 		return nil
