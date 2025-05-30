@@ -315,3 +315,64 @@ func IsJobComplete(job *batchv1.Job) bool {
 func IsJobFailed(job *batchv1.Job) bool {
 	return job != nil && job.Status.Failed > 0
 }
+
+// CreateBackupJob creates a job to backup a catalog
+func CreateBackupJob(catalog *ducklakev1alpha1.DuckLakeCatalog, backupPath string) (*batchv1.Job, error) {
+	// Generate backup script
+	backupScript := fmt.Sprintf(`#!/bin/sh
+set -e
+
+# Wait for catalog file to be available
+while [ ! -f %s ]; do
+  echo "Waiting for catalog file..."
+  sleep 1
+done
+
+# Create backup
+cp %s /tmp/backup.duckdb
+
+# Upload to S3
+aws s3 cp /tmp/backup.duckdb s3://%s/%s \
+	--endpoint-url %s \
+	--region %s
+`,
+		catalog.Spec.CatalogPath,
+		catalog.Spec.CatalogPath,
+		catalog.Spec.ObjectStore.Bucket,
+		backupPath,
+		catalog.Spec.ObjectStore.Endpoint,
+		catalog.Spec.ObjectStore.Region)
+
+	// Create job
+	job := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      fmt.Sprintf("%s-backup", catalog.Name),
+			Namespace: catalog.Namespace,
+		},
+		Spec: batchv1.JobSpec{
+			Template: corev1.PodTemplateSpec{
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{
+						{
+							Name:  "backup",
+							Image: "duckdb/duckdb:latest",
+							Command: []string{
+								"sh",
+								"-c",
+								backupScript,
+							},
+							Resources: corev1.ResourceRequirements{
+								Requests: corev1.ResourceList{
+									corev1.ResourceCPU:    resource.MustParse("100m"),
+									corev1.ResourceMemory: resource.MustParse("256Mi"),
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	return job, nil
+}

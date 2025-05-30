@@ -3,25 +3,36 @@ package controller
 import (
 	"context"
 	"fmt"
+	"os"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/rs/zerolog"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/manager"
 
 	ducklakev1alpha1 "github.com/TFMV/featherman/operator/api/v1alpha1"
 	"github.com/TFMV/featherman/operator/internal/config"
 	"github.com/TFMV/featherman/operator/internal/duckdb"
+	"github.com/TFMV/featherman/operator/internal/logger"
 	"github.com/TFMV/featherman/operator/internal/metrics"
+	"github.com/TFMV/featherman/operator/internal/retry"
 	"github.com/TFMV/featherman/operator/internal/sql"
+	"github.com/TFMV/featherman/operator/internal/storage"
 )
 
 // DuckLakeTableReconciler reconciles a DuckLakeTable object
@@ -32,6 +43,10 @@ type DuckLakeTableReconciler struct {
 	JobManager  *duckdb.JobManager
 	SQLGen      *sql.Generator
 	PodTemplate *config.PodTemplateConfig
+	Consistency *storage.ConsistencyChecker
+	Logger      *zerolog.Logger
+	RetryConfig retry.RetryConfig
+	Lifecycle   *duckdb.LifecycleManager
 }
 
 // +kubebuilder:rbac:groups=ducklake.featherman.dev,resources=ducklaketables,verbs=get;list;watch;create;update;patch;delete
@@ -43,8 +58,13 @@ type DuckLakeTableReconciler struct {
 
 // Reconcile handles DuckLakeTable resources
 func (r *DuckLakeTableReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	logger := log.FromContext(ctx)
-	logger.Info("reconciling DuckLakeTable", "namespacedName", req.NamespacedName)
+	l := logger.WithValues(r.Logger,
+		"controller", "DuckLakeTable",
+		"namespace", req.Namespace,
+		"name", req.Name)
+	ctx = logger.WithContext(ctx, l)
+
+	l.Info().Msg("reconciling DuckLakeTable")
 
 	startTime := time.Now()
 	defer func() {
@@ -57,6 +77,7 @@ func (r *DuckLakeTableReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		if errors.IsNotFound(err) {
 			return ctrl.Result{}, nil
 		}
+		l.Error().Err(err).Msg("failed to get DuckLakeTable")
 		metrics.RecordTableOperation("get", "failed")
 		return ctrl.Result{}, fmt.Errorf("failed to get DuckLakeTable: %w", err)
 	}
@@ -66,6 +87,7 @@ func (r *DuckLakeTableReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	if err := r.List(ctx, &jobs, client.InNamespace(table.Namespace), client.MatchingLabels{
 		"ducklake.featherman.dev/table": table.Name,
 	}); err != nil {
+		l.Error().Err(err).Msg("failed to list jobs")
 		return ctrl.Result{}, fmt.Errorf("failed to list jobs: %w", err)
 	}
 
@@ -80,9 +102,57 @@ func (r *DuckLakeTableReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 
 	// If we have a job, update the status based on its state
 	if latestJob != nil {
-		if duckdb.IsJobComplete(latestJob) {
-			table.Status.Phase = ducklakev1alpha1.TablePhaseSucceeded
-			table.Status.LastModified = &metav1.Time{Time: latestJob.Status.CompletionTime.Time}
+		state, err := r.Lifecycle.GetJobState(ctx, latestJob)
+		if err != nil {
+			l.Error().Err(err).Msg("failed to get job state")
+			return ctrl.Result{}, fmt.Errorf("failed to get job state: %w", err)
+		}
+
+		if state.Phase == duckdb.JobPhaseComplete {
+			// Verify Parquet file consistency with retries
+			verifyOp := func(ctx context.Context) error {
+				return r.Consistency.VerifyParquetConsistency(ctx, table)
+			}
+
+			if err := retry.Do(ctx, verifyOp, r.RetryConfig); err != nil {
+				l.Error().Err(err).Msg("failed to verify Parquet consistency")
+				table.Status.Phase = ducklakev1alpha1.TablePhaseFailed
+				metrics.RecordTableOperation("verify_consistency", "failed")
+				r.Recorder.Event(table, corev1.EventTypeWarning, "ConsistencyCheckFailed", err.Error())
+				if err := r.Status().Update(ctx, table); err != nil {
+					l.Error().Err(err).Msg("failed to update status")
+					return ctrl.Result{}, fmt.Errorf("failed to update status: %w", err)
+				}
+				return ctrl.Result{}, fmt.Errorf("failed to verify Parquet consistency: %w", err)
+			}
+			metrics.RecordTableOperation("verify_consistency", "succeeded")
+
+			// List Parquet files to update status
+			listOp := func(ctx context.Context) error {
+				objects, err := r.Consistency.ListParquetFiles(ctx, table)
+				if err != nil {
+					return err
+				}
+
+				// Calculate total bytes written
+				var totalBytes int64
+				for _, obj := range objects {
+					totalBytes += *obj.Size
+				}
+
+				// Update status
+				table.Status.Phase = ducklakev1alpha1.TablePhaseSucceeded
+				table.Status.LastModified = &metav1.Time{Time: state.CompletionTime.Time}
+				table.Status.BytesWritten = totalBytes
+
+				return nil
+			}
+
+			if err := retry.Do(ctx, listOp, r.RetryConfig); err != nil {
+				l.Error().Err(err).Msg("failed to list Parquet files")
+				r.Recorder.Event(table, corev1.EventTypeWarning, "ListParquetFilesFailed", err.Error())
+				return ctrl.Result{}, fmt.Errorf("failed to list Parquet files: %w", err)
+			}
 
 			// Record metrics
 			if latestJob.Labels["app.kubernetes.io/operation"] == string(duckdb.OperationTypeWrite) {
@@ -93,14 +163,45 @@ func (r *DuckLakeTableReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 
 			// Update status
 			if err := r.Status().Update(ctx, table); err != nil {
+				l.Error().Err(err).Msg("failed to update status")
 				r.Recorder.Event(table, corev1.EventTypeWarning, "StatusUpdateFailed", err.Error())
 				return ctrl.Result{}, fmt.Errorf("failed to update status: %w", err)
 			}
 
-			// Job is complete, nothing more to do
+			// Get job logs for debugging
+			logs, err := r.Lifecycle.GetJobLogs(ctx, latestJob)
+			if err != nil {
+				l.Warn().Err(err).Msg("failed to get job logs")
+			} else {
+				for podName, log := range logs {
+					l.Debug().
+						Str("pod", podName).
+						Str("logs", log).
+						Msg("job pod logs")
+				}
+			}
+
+			l.Info().
+				Int64("bytesWritten", table.Status.BytesWritten).
+				Time("lastModified", table.Status.LastModified.Time).
+				Msg("table reconciliation completed successfully")
+
 			return ctrl.Result{}, nil
-		} else if duckdb.IsJobFailed(latestJob) {
+		} else if state.Phase == duckdb.JobPhaseFailed {
 			table.Status.Phase = ducklakev1alpha1.TablePhaseFailed
+
+			// Get job logs for debugging
+			logs, err := r.Lifecycle.GetJobLogs(ctx, latestJob)
+			if err != nil {
+				l.Warn().Err(err).Msg("failed to get job logs")
+			} else {
+				for podName, log := range logs {
+					l.Error().
+						Str("pod", podName).
+						Str("logs", log).
+						Msg("job failed, pod logs")
+				}
+			}
 
 			// Record metrics
 			if latestJob.Labels["app.kubernetes.io/operation"] == string(duckdb.OperationTypeWrite) {
@@ -111,9 +212,17 @@ func (r *DuckLakeTableReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 
 			// Update status
 			if err := r.Status().Update(ctx, table); err != nil {
+				l.Error().Err(err).Msg("failed to update status")
 				r.Recorder.Event(table, corev1.EventTypeWarning, "StatusUpdateFailed", err.Error())
 				return ctrl.Result{}, fmt.Errorf("failed to update status: %w", err)
 			}
+
+			l.Warn().
+				Str("jobName", latestJob.Name).
+				Str("message", state.Message).
+				Msg("job failed")
+
+			return ctrl.Result{}, fmt.Errorf("job failed: %s", state.Message)
 		}
 	}
 
@@ -121,6 +230,7 @@ func (r *DuckLakeTableReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	if table.Status.Phase == "" {
 		table.Status.Phase = ducklakev1alpha1.TablePhasePending
 		if err := r.Status().Update(ctx, table); err != nil {
+			l.Error().Err(err).Msg("failed to update status")
 			metrics.RecordTableOperation("status_update", "failed")
 			return ctrl.Result{}, fmt.Errorf("failed to update status: %w", err)
 		}
@@ -131,6 +241,7 @@ func (r *DuckLakeTableReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	if !controllerutil.ContainsFinalizer(table, "ducklaketable.featherman.dev") {
 		controllerutil.AddFinalizer(table, "ducklaketable.featherman.dev")
 		if err := r.Update(ctx, table); err != nil {
+			l.Error().Err(err).Msg("failed to add finalizer")
 			metrics.RecordTableOperation("add_finalizer", "failed")
 			return ctrl.Result{}, fmt.Errorf("failed to add finalizer: %w", err)
 		}
@@ -139,9 +250,11 @@ func (r *DuckLakeTableReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 
 	// Handle deletion
 	if !table.DeletionTimestamp.IsZero() {
+		l.Info().Msg("handling table deletion")
 		metrics.RecordTableOperation("delete", "started")
 		result, err := r.handleDeletion(ctx, table)
 		if err != nil {
+			l.Error().Err(err).Msg("failed to handle deletion")
 			metrics.RecordTableOperation("delete", "failed")
 			return result, err
 		}
@@ -150,10 +263,21 @@ func (r *DuckLakeTableReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	}
 
 	// Only create a new job if there's no existing job or if the existing job has failed
-	if latestJob == nil || duckdb.IsJobFailed(latestJob) {
+	var state *duckdb.JobState
+	var err error
+	if latestJob != nil {
+		state, err = r.Lifecycle.GetJobState(ctx, latestJob)
+		if err != nil {
+			l.Error().Err(err).Msg("failed to get job state")
+			return ctrl.Result{}, fmt.Errorf("failed to get job state: %w", err)
+		}
+	}
+
+	if latestJob == nil || (state != nil && state.Phase == duckdb.JobPhaseFailed) {
 		// Generate SQL for table creation
 		createSQL, err := r.SQLGen.CreateTableSQL(table)
 		if err != nil {
+			l.Error().Err(err).Msg("failed to generate create table SQL")
 			table.Status.Phase = ducklakev1alpha1.TablePhaseFailed
 			metrics.RecordTableOperation("generate_sql", "failed")
 			r.Recorder.Event(table, corev1.EventTypeWarning, "SQLGenerationFailed", err.Error())
@@ -163,6 +287,7 @@ func (r *DuckLakeTableReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		// Generate SQL for attaching Parquet files
 		attachSQL, err := r.SQLGen.AttachParquetSQL(table, table.Spec.Location)
 		if err != nil {
+			l.Error().Err(err).Msg("failed to generate attach SQL")
 			table.Status.Phase = ducklakev1alpha1.TablePhaseFailed
 			metrics.RecordTableOperation("generate_sql", "failed")
 			r.Recorder.Event(table, corev1.EventTypeWarning, "SQLGenerationFailed", err.Error())
@@ -175,6 +300,9 @@ func (r *DuckLakeTableReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 			Namespace: table.Namespace,
 			Name:      table.Spec.CatalogRef,
 		}, catalog); err != nil {
+			l.Error().Err(err).
+				Str("catalogRef", table.Spec.CatalogRef).
+				Msg("failed to get catalog")
 			r.Recorder.Event(table, corev1.EventTypeWarning, "CatalogNotFound", err.Error())
 			return ctrl.Result{}, fmt.Errorf("failed to get catalog: %w", err)
 		}
@@ -189,9 +317,16 @@ func (r *DuckLakeTableReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 			JobNameSuffix: "create",
 		}
 
-		// Create the job
-		job, err := r.JobManager.CreateJob(op)
-		if err != nil {
+		// Create the job with retries
+		var job *batchv1.Job
+		createOp := func(ctx context.Context) error {
+			var err error
+			job, err = r.JobManager.CreateJob(op)
+			return err
+		}
+
+		if err := retry.Do(ctx, createOp, r.RetryConfig); err != nil {
+			l.Error().Err(err).Msg("failed to create job")
 			table.Status.Phase = ducklakev1alpha1.TablePhaseFailed
 			metrics.RecordTableOperation("create_job", "failed")
 			r.Recorder.Event(table, corev1.EventTypeWarning, "JobCreationFailed", err.Error())
@@ -201,12 +336,14 @@ func (r *DuckLakeTableReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 
 		// Set controller reference
 		if err := ctrl.SetControllerReference(table, job, r.Scheme); err != nil {
+			l.Error().Err(err).Msg("failed to set controller reference")
 			r.Recorder.Event(table, corev1.EventTypeWarning, "SetControllerReferenceFailed", err.Error())
 			return ctrl.Result{}, fmt.Errorf("failed to set controller reference: %w", err)
 		}
 
 		// Create the job
 		if err := r.Create(ctx, job); err != nil {
+			l.Error().Err(err).Msg("failed to create job")
 			r.Recorder.Event(table, corev1.EventTypeWarning, "JobCreationFailed", err.Error())
 			return ctrl.Result{}, fmt.Errorf("failed to create job: %w", err)
 		}
@@ -215,15 +352,25 @@ func (r *DuckLakeTableReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		table.Status.Phase = ducklakev1alpha1.TablePhasePending
 		table.Status.ObservedGeneration = table.Generation
 		if err := r.Status().Update(ctx, table); err != nil {
+			l.Error().Err(err).Msg("failed to update status")
 			r.Recorder.Event(table, corev1.EventTypeWarning, "StatusUpdateFailed", err.Error())
 			return ctrl.Result{}, fmt.Errorf("failed to update status: %w", err)
 		}
 
-		logger.Info("created table creation job", "job", job.Name)
+		l.Info().
+			Str("jobName", job.Name).
+			Str("phase", string(table.Status.Phase)).
+			Msg("created table creation job")
+
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
 
 	// If we get here, there's an existing job that's still running
+	l.Debug().
+		Str("jobName", latestJob.Name).
+		Str("phase", string(table.Status.Phase)).
+		Msg("job still running")
+
 	return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 }
 
@@ -281,6 +428,78 @@ func (r *DuckLakeTableReconciler) handleDeletion(ctx context.Context, table *duc
 func (r *DuckLakeTableReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	// Initialize with default pod template
 	r.PodTemplate = config.DefaultPodTemplateConfig()
+
+	// Initialize logger
+	r.Logger = &zerolog.Logger{}
+	*r.Logger = zerolog.New(zerolog.ConsoleWriter{
+		Out:        os.Stdout,
+		TimeFormat: time.RFC3339Nano,
+	}).With().Timestamp().Logger()
+
+	// Initialize retry config
+	r.RetryConfig = retry.DefaultRetryConfig
+
+	// Initialize lifecycle manager
+	kubeClient, err := kubernetes.NewForConfig(mgr.GetConfig())
+	if err != nil {
+		return fmt.Errorf("failed to create kubernetes client: %w", err)
+	}
+	r.Lifecycle = duckdb.NewLifecycleManager(r.Client, kubeClient)
+
+	// Initialize consistency checker
+	s3Client := s3.NewFromConfig(aws.Config{
+		Region: "us-east-1", // Default region, will be overridden by endpoint resolver
+		EndpointResolverWithOptions: aws.EndpointResolverWithOptionsFunc(func(service, region string, options ...interface{}) (aws.Endpoint, error) {
+			return aws.Endpoint{
+				URL:               "http://minio:9000", // Default MinIO endpoint
+				SigningRegion:     "us-east-1",
+				HostnameImmutable: true,
+			}, nil
+		}),
+		Credentials: credentials.NewStaticCredentialsProvider(
+			"minioadmin", // Default MinIO access key
+			"minioadmin", // Default MinIO secret key
+			"",
+		),
+	})
+
+	r.Consistency = storage.NewConsistencyChecker(r.Client, s3Client).
+		WithTimeout(storage.DefaultTimeout).
+		WithInterval(storage.DefaultInterval).
+		WithRetries(storage.DefaultRetries)
+
+	// Start job cleanup goroutine
+	cleanupCtx, cancel := context.WithCancel(context.Background())
+	go func() {
+		ticker := time.NewTicker(1 * time.Hour)
+		defer ticker.Stop()
+		defer cancel()
+
+		for {
+			select {
+			case <-mgr.Elected():
+				// Only run cleanup when we're the leader
+				if err := r.Lifecycle.CleanupJobs(cleanupCtx, "", labels.SelectorFromSet(labels.Set{
+					"app.kubernetes.io/managed-by": "featherman",
+				})); err != nil {
+					r.Logger.Error().Err(err).Msg("failed to cleanup jobs")
+				}
+			case <-cleanupCtx.Done():
+				return
+			case <-ticker.C:
+				continue
+			}
+		}
+	}()
+
+	// Add cleanup context cancellation to manager
+	if err := mgr.Add(manager.RunnableFunc(func(ctx context.Context) error {
+		<-ctx.Done()
+		cancel()
+		return nil
+	})); err != nil {
+		return fmt.Errorf("failed to add cleanup context cancellation: %w", err)
+	}
 
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&ducklakev1alpha1.DuckLakeTable{}).
