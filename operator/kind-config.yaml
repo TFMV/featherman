@@ -1,0 +1,18 @@
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+- role: control-plane
+  extraPortMappings:
+  - containerPort: 9000  # For MinIO API
+    hostPort: 9200
+  - containerPort: 9001  # For MinIO Console
+    hostPort: 9201
+  extraMounts:
+  - hostPath: /tmp/featherman-e2e
+    containerPath: /var/lib/featherman
+  kubeadmConfigPatches:
+  - |
+    kind: InitConfiguration
+    nodeRegistration:
+      kubeletExtraArgs:
+        node-labels: "ingress-ready=true"

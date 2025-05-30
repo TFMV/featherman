@@ -1,0 +1,23 @@
+apiVersion: ducklake.featherman.dev/v1alpha1
+kind: DuckLakeCatalog
+metadata:
+  labels:
+    app.kubernetes.io/name: featherman
+    app.kubernetes.io/managed-by: kustomize
+  name: ducklakecatalog-sample
+spec:
+  storageClass: standard
+  size: 10Gi
+  objectStore:
+    endpoint: https://s3.example.com
+    bucket: ducklake-test
+    region: us-east-1
+    credentialsSecret:
+      name: s3-credentials
+      accessKeyField: access-key
+      secretKeyField: secret-key
+  backupPolicy:
+    schedule: "0 0 * * *" # Daily at midnight
+    retentionDays: 7
+  encryption:
+    kmsKeyId: arn:aws:kms:us-east-1:123456789012:key/1234abcd-12ab-34cd-56ef-1234567890ab

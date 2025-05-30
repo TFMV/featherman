@@ -1,0 +1,10 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: minio-test-pod
+  namespace: minio-test
+spec:
+  containers:
+    - name: test
+      image: curlimages/curl
+      command: ["sleep", "3600"]

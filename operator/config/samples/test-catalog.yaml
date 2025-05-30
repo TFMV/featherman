@@ -1,0 +1,15 @@
+apiVersion: ducklake.featherman.dev/v1alpha1
+kind: DuckLakeCatalog
+metadata:
+  name: test-catalog
+  namespace: minio-test
+spec:
+  storageClass: standard
+  size: 1Gi
+  objectStore:
+    endpoint: http://minio.minio-test:9000
+    bucket: test-bucket
+    credentialsSecret:
+      name: minio-creds
+      accessKeyField: access-key
+      secretKeyField: secret-key
