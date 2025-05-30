@@ -3,6 +3,7 @@ package duckdb
 import (
 	"fmt"
 	"path"
+	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -223,9 +224,9 @@ func (op *Operation) CreateJob() (*batchv1.Job, error) {
 					Containers: []corev1.Container{
 						{
 							Name:  "duckdb",
-							Image: "duckdb/duckdb:latest",
+							Image: "datacatering/duckdb:v1.3.0",
 							Command: []string{
-								"duckdb",
+								"/duckdb",
 								path.Join("/catalog", op.Catalog.Spec.CatalogPath),
 								"-c",
 								op.SQL,
@@ -328,16 +329,16 @@ while [ ! -f %s ]; do
   sleep 1
 done
 
-# Create backup
-cp %s /tmp/backup.duckdb
+# Create backup using DuckDB CLI
+/duckdb %s -c ".backup /tmp/backup.duckdb"
 
 # Upload to S3
 aws s3 cp /tmp/backup.duckdb s3://%s/%s \
 	--endpoint-url %s \
 	--region %s
 `,
-		catalog.Spec.CatalogPath,
-		catalog.Spec.CatalogPath,
+		path.Join("/catalog", catalog.Spec.CatalogPath),
+		path.Join("/catalog", catalog.Spec.CatalogPath),
 		catalog.Spec.ObjectStore.Bucket,
 		backupPath,
 		catalog.Spec.ObjectStore.Endpoint,
@@ -346,16 +347,35 @@ aws s3 cp /tmp/backup.duckdb s3://%s/%s \
 	// Create job
 	job := &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      fmt.Sprintf("%s-backup", catalog.Name),
+			Name:      fmt.Sprintf("%s-backup-%s", catalog.Name, time.Now().Format("20060102150405")),
 			Namespace: catalog.Namespace,
+			Labels: map[string]string{
+				"app.kubernetes.io/name":      "featherman",
+				"app.kubernetes.io/component": "backup",
+				"app.kubernetes.io/part-of":   "ducklake",
+			},
 		},
 		Spec: batchv1.JobSpec{
+			BackoffLimit: &[]int32{3}[0],
 			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: map[string]string{
+						"app.kubernetes.io/name":      "featherman",
+						"app.kubernetes.io/component": "backup",
+						"app.kubernetes.io/part-of":   "ducklake",
+					},
+				},
 				Spec: corev1.PodSpec{
+					RestartPolicy: corev1.RestartPolicyOnFailure,
+					SecurityContext: &corev1.PodSecurityContext{
+						RunAsNonRoot: &[]bool{true}[0],
+						RunAsUser:    &[]int64{1000}[0],
+						FSGroup:      &[]int64{1000}[0],
+					},
 					Containers: []corev1.Container{
 						{
 							Name:  "backup",
-							Image: "duckdb/duckdb:latest",
+							Image: "datacatering/duckdb:v1.3.0",
 							Command: []string{
 								"sh",
 								"-c",
@@ -366,6 +386,76 @@ aws s3 cp /tmp/backup.duckdb s3://%s/%s \
 									corev1.ResourceCPU:    resource.MustParse("100m"),
 									corev1.ResourceMemory: resource.MustParse("256Mi"),
 								},
+								Limits: corev1.ResourceList{
+									corev1.ResourceCPU:    resource.MustParse("500m"),
+									corev1.ResourceMemory: resource.MustParse("1Gi"),
+								},
+							},
+							SecurityContext: &corev1.SecurityContext{
+								ReadOnlyRootFilesystem: &[]bool{false}[0],
+								Capabilities: &corev1.Capabilities{
+									Drop: []corev1.Capability{"ALL"},
+								},
+							},
+							VolumeMounts: []corev1.VolumeMount{
+								{
+									Name:      "catalog",
+									MountPath: "/catalog",
+									ReadOnly:  true,
+								},
+								{
+									Name:      "tmp",
+									MountPath: "/tmp",
+								},
+							},
+							Env: []corev1.EnvVar{
+								{
+									Name:  "AWS_ENDPOINT_URL",
+									Value: catalog.Spec.ObjectStore.Endpoint,
+								},
+								{
+									Name:  "AWS_REGION",
+									Value: catalog.Spec.ObjectStore.Region,
+								},
+								{
+									Name: "AWS_ACCESS_KEY_ID",
+									ValueFrom: &corev1.EnvVarSource{
+										SecretKeyRef: &corev1.SecretKeySelector{
+											LocalObjectReference: corev1.LocalObjectReference{
+												Name: catalog.Spec.ObjectStore.CredentialsSecret.Name,
+											},
+											Key: catalog.Spec.ObjectStore.CredentialsSecret.AccessKeyField,
+										},
+									},
+								},
+								{
+									Name: "AWS_SECRET_ACCESS_KEY",
+									ValueFrom: &corev1.EnvVarSource{
+										SecretKeyRef: &corev1.SecretKeySelector{
+											LocalObjectReference: corev1.LocalObjectReference{
+												Name: catalog.Spec.ObjectStore.CredentialsSecret.Name,
+											},
+											Key: catalog.Spec.ObjectStore.CredentialsSecret.SecretKeyField,
+										},
+									},
+								},
+							},
+						},
+					},
+					Volumes: []corev1.Volume{
+						{
+							Name: "catalog",
+							VolumeSource: corev1.VolumeSource{
+								PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+									ClaimName: fmt.Sprintf("%s-catalog", catalog.Name),
+									ReadOnly:  true,
+								},
+							},
+						},
+						{
+							Name: "tmp",
+							VolumeSource: corev1.VolumeSource{
+								EmptyDir: &corev1.EmptyDirVolumeSource{},
 							},
 						},
 					},

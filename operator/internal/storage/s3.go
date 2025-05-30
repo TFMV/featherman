@@ -51,7 +51,7 @@ type s3Client struct {
 func NewS3Client(ctx context.Context, cfg S3Config) (S3Client, error) {
 	logger := log.FromContext(ctx)
 	logger.Info("creating S3 client", "endpoint", cfg.Endpoint)
-
+	// TODO: Update to use the new AWS SDK v2
 	customResolver := aws.EndpointResolverWithOptionsFunc(func(service, region string, options ...interface{}) (aws.Endpoint, error) {
 		return aws.Endpoint{
 			URL:               cfg.Endpoint,

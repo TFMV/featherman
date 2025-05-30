@@ -259,38 +259,39 @@ func (r *DuckLakeCatalogReconciler) handleDeletion(ctx context.Context, catalog 
 
 // reconcilePVC ensures the PVC exists and is configured correctly
 func (r *DuckLakeCatalogReconciler) reconcilePVC(ctx context.Context, catalog *ducklakev1alpha1.DuckLakeCatalog) (*corev1.PersistentVolumeClaim, error) {
-	// Ensure PVC exists
-	pvc := &corev1.PersistentVolumeClaim{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      fmt.Sprintf("%s-catalog", catalog.Name),
-			Namespace: catalog.Namespace,
-		},
-	}
-
-	if _, err := ctrl.CreateOrUpdate(ctx, r.Client, pvc, func() error {
-		// Set owner reference
-		if err := ctrl.SetControllerReference(catalog, pvc, r.Scheme); err != nil {
-			return err
+	pvcName := fmt.Sprintf("%s-catalog", catalog.Name)
+	pvc := &corev1.PersistentVolumeClaim{}
+	err := r.Get(ctx, client.ObjectKey{Namespace: catalog.Namespace, Name: pvcName}, pvc)
+	if err != nil {
+		if !errors.IsNotFound(err) {
+			return nil, fmt.Errorf("failed to get PVC: %w", err)
 		}
-
-		// Update PVC spec
-		pvc.Spec = corev1.PersistentVolumeClaimSpec{
-			AccessModes: []corev1.PersistentVolumeAccessMode{
-				corev1.ReadWriteOnce,
+		// PVC doesn't exist, create it
+		pvc = &corev1.PersistentVolumeClaim{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      pvcName,
+				Namespace: catalog.Namespace,
 			},
-			Resources: corev1.VolumeResourceRequirements{
-				Requests: corev1.ResourceList{
-					corev1.ResourceStorage: resource.MustParse(catalog.Spec.Size),
+			Spec: corev1.PersistentVolumeClaimSpec{
+				AccessModes: []corev1.PersistentVolumeAccessMode{
+					corev1.ReadWriteOnce,
 				},
+				Resources: corev1.VolumeResourceRequirements{
+					Requests: corev1.ResourceList{
+						corev1.ResourceStorage: resource.MustParse(catalog.Spec.Size),
+					},
+				},
+				StorageClassName: &catalog.Spec.StorageClass,
 			},
-			StorageClassName: &catalog.Spec.StorageClass,
 		}
-
-		return nil
-	}); err != nil {
-		return nil, fmt.Errorf("failed to ensure PVC: %w", err)
+		if err := ctrl.SetControllerReference(catalog, pvc, r.Scheme); err != nil {
+			return nil, fmt.Errorf("failed to set controller reference: %w", err)
+		}
+		if err := r.Create(ctx, pvc); err != nil {
+			return nil, fmt.Errorf("failed to create PVC: %w", err)
+		}
 	}
-
+	// PVC exists, no need to update immutable fields
 	return pvc, nil
 }
 

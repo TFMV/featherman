@@ -30,10 +30,19 @@ apiVersion: kind.x-k8s.io/v1alpha4
 nodes:
 - role: control-plane
   extraPortMappings:
-  - containerPort: 9000  # For MinIO
-    hostPort: 9000
+  - containerPort: 9000  # For MinIO API
+    hostPort: 9200
   - containerPort: 9001  # For MinIO Console
-    hostPort: 9001
+    hostPort: 9201
+  extraMounts:
+  - hostPath: /tmp/featherman-e2e
+    containerPath: /var/lib/featherman
+  kubeadmConfigPatches:
+  - |
+    kind: InitConfiguration
+    nodeRegistration:
+      kubeletExtraArgs:
+        node-labels: "ingress-ready=true"
 EOF
 
 # Create cluster
@@ -94,12 +103,12 @@ spec:
         - --console-address
         - ":9001"
         env:
-        - name: MINIO_ACCESS_KEY
+        - name: MINIO_ROOT_USER
           valueFrom:
             secretKeyRef:
               name: minio-creds
               key: access-key
-        - name: MINIO_SECRET_KEY
+        - name: MINIO_ROOT_PASSWORD
           valueFrom:
             secretKeyRef:
               name: minio-creds
@@ -161,6 +170,6 @@ kubectl -n featherman-system wait --for=condition=Available deployment/featherma
 echo "KinD cluster setup complete!"
 echo "Cluster name: ${CLUSTER_NAME}"
 echo "MinIO API endpoint: minio.minio-test.svc.cluster.local:9000"
-echo "MinIO Console: http://localhost:9001"
+echo "MinIO Console: http://localhost:9201"
 echo "MinIO credentials: minioadmin / minioadmin"
 echo "To delete the cluster: kind delete cluster --name ${CLUSTER_NAME}" 

@@ -2,7 +2,9 @@
 
 Featherman brings DuckDB's powerful DuckLake functionality to Kubernetes, enabling declarative management of data lakes with the simplicity of DuckDB and the scalability of cloud object storage.
 
-## Features
+> This project is in early development. Any contributions are appreciated.
+
+## Features (In Progress
 
 - 🦆 **DuckDB-Native**: Leverages DuckDB's simplicity and performance
 - 🎯 **Declarative**: Define your data lake structure using Kubernetes CRDs

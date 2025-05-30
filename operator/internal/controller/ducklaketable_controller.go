@@ -392,6 +392,16 @@ func (r *DuckLakeTableReconciler) handleDeletion(ctx context.Context, table *duc
 		Namespace: table.Namespace,
 		Name:      table.Spec.CatalogRef,
 	}, catalog); err != nil {
+		if errors.IsNotFound(err) {
+			// If catalog is not found, just remove the finalizer and return
+			l.Info().Msg("catalog not found, skipping cleanup")
+			controllerutil.RemoveFinalizer(table, "ducklaketable.featherman.dev")
+			if err := r.Update(ctx, table); err != nil {
+				l.Error().Err(err).Msg("failed to remove finalizer")
+				return ctrl.Result{}, fmt.Errorf("failed to remove finalizer: %w", err)
+			}
+			return ctrl.Result{}, nil
+		}
 		l.Error().Err(err).Msg("failed to get catalog")
 		r.Recorder.Event(table, corev1.EventTypeWarning, "CatalogNotFound", err.Error())
 		return ctrl.Result{}, fmt.Errorf("failed to get catalog: %w", err)
