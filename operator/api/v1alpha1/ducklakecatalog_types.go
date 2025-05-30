@@ -102,6 +102,10 @@ type DuckLakeCatalogSpec struct {
 	// BackupPolicy defines the backup configuration
 	// +optional
 	BackupPolicy *BackupPolicySpec `json:"backupPolicy,omitempty"`
+
+	// CatalogPath is the path to the DuckDB catalog file within the PVC
+	// +kubebuilder:default=/catalog/catalog.db
+	CatalogPath string `json:"catalogPath,omitempty"`
 }
 
 // CatalogPhase represents the current phase of the catalog
