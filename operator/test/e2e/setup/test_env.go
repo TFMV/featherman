@@ -7,6 +7,7 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
@@ -35,22 +36,32 @@ func NewTestEnv(client client.Client) *TestEnv {
 
 // Setup prepares the test environment
 func (e *TestEnv) Setup(ctx context.Context) error {
-	if err := e.setupMinioNamespace(ctx); err != nil {
-		return fmt.Errorf("failed to setup namespace: %w", err)
+	// Check if MinIO namespace exists
+	ns := &corev1.Namespace{}
+	err := e.Client.Get(ctx, client.ObjectKey{Name: MinioNamespace}, ns)
+	if err != nil {
+		if !apierrors.IsNotFound(err) {
+			return fmt.Errorf("failed to check namespace: %w", err)
+		}
+		// Namespace doesn't exist, create it and set up MinIO
+		if err := e.setupMinioNamespace(ctx); err != nil {
+			return fmt.Errorf("failed to setup namespace: %w", err)
+		}
+
+		if err := e.setupMinioSecret(ctx); err != nil {
+			return fmt.Errorf("failed to setup secret: %w", err)
+		}
+
+		if err := e.setupMinioDeployment(ctx); err != nil {
+			return fmt.Errorf("failed to setup deployment: %w", err)
+		}
+
+		if err := e.setupMinioService(ctx); err != nil {
+			return fmt.Errorf("failed to setup service: %w", err)
+		}
 	}
 
-	if err := e.setupMinioSecret(ctx); err != nil {
-		return fmt.Errorf("failed to setup secret: %w", err)
-	}
-
-	if err := e.setupMinioDeployment(ctx); err != nil {
-		return fmt.Errorf("failed to setup deployment: %w", err)
-	}
-
-	if err := e.setupMinioService(ctx); err != nil {
-		return fmt.Errorf("failed to setup service: %w", err)
-	}
-
+	// Always wait for MinIO to be ready
 	return e.waitForMinio(ctx)
 }
 
@@ -71,7 +82,12 @@ func (e *TestEnv) setupMinioNamespace(ctx context.Context) error {
 			Name: MinioNamespace,
 		},
 	}
-	return e.Client.Create(ctx, ns)
+	if err := e.Client.Create(ctx, ns); err != nil {
+		if !apierrors.IsAlreadyExists(err) {
+			return err
+		}
+	}
+	return nil
 }
 
 func (e *TestEnv) setupMinioSecret(ctx context.Context) error {

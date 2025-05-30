@@ -21,6 +21,42 @@ var _ = Describe("DuckLakeCatalog Controller", func() {
 		CatalogNamespace = "default"
 	)
 
+	BeforeEach(func() {
+		// Copy MinIO credentials secret to default namespace
+		ctx := context.Background()
+		minioSecret := &corev1.Secret{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{
+			Name:      "minio-creds",
+			Namespace: setup.MinioNamespace,
+		}, minioSecret)).Should(Succeed())
+
+		defaultSecret := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "minio-creds",
+				Namespace: CatalogNamespace,
+			},
+			Type: minioSecret.Type,
+			Data: minioSecret.Data,
+		}
+		err := k8sClient.Create(ctx, defaultSecret)
+		if err != nil {
+			// If the secret already exists, update it
+			Expect(k8sClient.Update(ctx, defaultSecret)).Should(Succeed())
+		}
+	})
+
+	AfterEach(func() {
+		// Clean up the copied secret
+		ctx := context.Background()
+		secret := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "minio-creds",
+				Namespace: CatalogNamespace,
+			},
+		}
+		_ = k8sClient.Delete(ctx, secret)
+	})
+
 	Context("When creating a DuckLakeCatalog", func() {
 		It("Should create and configure the catalog successfully", func() {
 			ctx := context.Background()
