@@ -59,10 +59,44 @@ spec:
 
 ## Architecture
 
-Featherman consists of two main components:
+Featherman follows a cloud-native architecture designed for reliability and scalability:
 
-- **Control Plane**: Kubernetes operator managing catalogs and tables
-- **Data Plane**: Ephemeral DuckDB jobs for data operations
+```mermaid
+graph TD
+    subgraph Control-Plane
+        OP[Operator]
+        BM[Backup Manager]
+        WH[Webhooks]
+    end
+    subgraph Data-Plane
+        JOB[DuckDB Jobs]
+        PVC[Catalog PVC]
+        S3[Object Store]
+    end
+    OP --> JOB
+    BM --> S3
+    JOB --> PVC
+    JOB --> S3
+```
+
+### Components
+
+- **Control Plane**
+  - **Operator**: Manages CRDs and orchestrates data operations
+  - **Backup Manager**: Handles scheduled backups and retention
+  - **Webhooks**: Validates and defaults resource configurations
+
+- **Data Plane**
+  - **DuckDB Jobs**: Ephemeral pods that execute SQL operations
+  - **Catalog Storage**: Persistent volumes storing DuckDB metadata
+  - **Object Store**: S3-compatible storage for Parquet data files
+
+### Key Design Principles
+
+1. **Separation of Concerns**: Metadata and data are stored separately for better scalability
+2. **Stateless Operations**: All operations run in ephemeral jobs for reliability
+3. **Cloud-Native Storage**: Leverages object storage for data and K8s volumes for metadata
+4. **Kubernetes Patterns**: Follows standard K8s patterns like operator pattern and CRDs
 
 ## License
 
