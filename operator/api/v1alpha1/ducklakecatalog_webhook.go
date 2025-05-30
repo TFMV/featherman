@@ -4,6 +4,7 @@ import (
 	"net/url"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/validation/field"
@@ -100,7 +101,22 @@ func (r *DuckLakeCatalog) ValidateDelete() (admission.Warnings, error) {
 
 // isValidStorageSize validates storage size format
 func isValidStorageSize(size string) bool {
-	// Simple validation for now - should match pattern like "1Gi", "500Mi", etc.
-	// Could be made more robust with proper quantity parsing
-	return true // TODO: Implement proper validation
+	// Parse the storage size using k8s resource quantity
+	quantity, err := resource.ParseQuantity(size)
+	if err != nil {
+		return false
+	}
+
+	// Ensure size is positive
+	if quantity.Sign() <= 0 {
+		return false
+	}
+
+	// Ensure size is at least 1Gi
+	minSize := resource.MustParse("1Gi")
+	if quantity.Cmp(minSize) < 0 {
+		return false
+	}
+
+	return true
 }
