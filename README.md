@@ -1,43 +1,30 @@
-# 🪶 Featherman
+# Featherman
 
-> ⚠️ **Early Development Notice**: Featherman is currently in early development. While the core design is established, the implementation is actively evolving. We welcome early feedback and contributions!
+Featherman brings DuckDB's powerful DuckLake functionality to Kubernetes, enabling declarative management of data lakes with the simplicity of DuckDB and the scalability of cloud object storage.
 
-## What is Featherman?
+## Features
 
-Featherman is a Kubernetes operator that brings DuckDB's DuckLake functionality to Kubernetes, enabling declarative management of data lakes with the simplicity of DuckDB and the scalability of cloud object storage.
+- 🦆 **DuckDB-Native**: Leverages DuckDB's simplicity and performance
+- 🎯 **Declarative**: Define your data lake structure using Kubernetes CRDs
+- ☁️ **Cloud Storage**: Seamless integration with S3-compatible object stores
+- 🔒 **Enterprise Ready**: Built-in backup, encryption, and monitoring
+- 🚀 **Kubernetes-Native**: Fully integrated with K8s ecosystem
 
-### Key Features
+## Quick Start
 
-- **Declarative Data Lake Management**: Define your data lake structure using Kubernetes Custom Resources
-- **Cloud-Native Storage**: Seamlessly integrate with S3-compatible object stores
-- **Simple Yet Powerful**: Leverages DuckDB's simplicity while providing enterprise features
-- **Kubernetes-Native**: Fully integrated with Kubernetes ecosystem and tooling
+1. Install Featherman:
 
-## Architecture
+```bash
+kubectl apply -f https://raw.githubusercontent.com/TFMV/featherman/main/deploy/manifests.yaml
+```
 
-Featherman consists of two main components:
-
-1. **Control Plane**:
-   - Kubernetes operator managing the lifecycle of catalogs and tables
-   - Handles metadata management and coordination
-   - Manages backup and retention policies
-
-2. **Data Plane**:
-   - Ephemeral DuckDB jobs for data operations
-   - Direct Parquet I/O with object storage
-   - Catalog storage on persistent volumes
-
-## Custom Resources
-
-### DuckLakeCatalog
-
-The `DuckLakeCatalog` resource defines a DuckDB catalog and its storage configuration:
+2. Create a catalog:
 
 ```yaml
 apiVersion: ducklake.featherman.dev/v1alpha1
 kind: DuckLakeCatalog
 metadata:
-  name: example-catalog
+  name: example
 spec:
   storageClass: standard
   size: 10Gi
@@ -45,77 +32,38 @@ spec:
     endpoint: s3.amazonaws.com
     bucket: my-data-lake
     region: us-west-2
-  encryption:
-    provider: aws-kms
-    keyId: my-key
   backupPolicy:
-    schedule: "0 0 * * *"
-    retentionDays: 30
+    schedule: "0 2 * * *"    # Daily at 2 AM
+    retentionDays: 7
 ```
 
-### DuckLakeTable
-
-The `DuckLakeTable` resource defines table structure and storage options:
+3. Create a table:
 
 ```yaml
 apiVersion: ducklake.featherman.dev/v1alpha1
 kind: DuckLakeTable
 metadata:
-  name: example-table
+  name: users
 spec:
-  catalogRef: example-catalog
+  catalogRef: example
   name: users
   columns:
     - name: id
-      type: BIGINT
+      type: INTEGER
     - name: name
       type: VARCHAR
-      nullable: true
-  partitioning:
-    - created_at
   format:
     compression: ZSTD
-  ttlDays: 90
-  mode: append
+    partitioning: ["created_at"]
 ```
 
-## Features
+## Architecture
 
-- **Simplified Data Lake Management**: Create and manage data lakes using familiar Kubernetes tooling
-- **Cloud Storage Integration**: Native support for S3-compatible object stores
-- **Data Lifecycle Management**: Automatic data retention and backup policies
-- **Security**:
-  - Encryption at rest with KMS integration
-  - Kubernetes RBAC integration
-  - Secure credential management
-- **Operational Excellence**:
-  - Monitoring and metrics
-  - Backup and restore capabilities
-  - Detailed status reporting
+Featherman consists of two main components:
 
-## Getting Started
-
-> Coming Soon: Installation and usage instructions will be added as the project matures.
-
-## Development Status
-
-Featherman is in active development. Current focus areas:
-
-- [ ] Core operator implementation
-- [ ] Basic catalog and table management
-- [ ] S3 integration
-- [ ] Initial documentation
-- [ ] Testing infrastructure
-
-## Contributing
-
-While we're in early development, we welcome:
-
-- Feature suggestions
-- Design feedback
-- Use case discussions
-- Early testing and feedback
+- **Control Plane**: Kubernetes operator managing catalogs and tables
+- **Data Plane**: Ephemeral DuckDB jobs for data operations
 
 ## License
 
-[MIT](LICENSE)
+MIT
