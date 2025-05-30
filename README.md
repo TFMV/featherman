@@ -43,7 +43,15 @@ make deploy
 1. Install Featherman:
 
 ```bash
-kubectl apply -f https://raw.githubusercontent.com/TFMV/featherman/main/deploy/manifests.yaml
+# Clone the repository
+git clone https://github.com/TFMV/featherman.git
+cd featherman/operator
+
+# Install CRDs
+make install
+
+# Deploy the operator
+make deploy
 ```
 
 2. Create a catalog:
