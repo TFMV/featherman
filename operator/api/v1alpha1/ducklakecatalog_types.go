@@ -17,7 +17,6 @@ limitations under the License.
 package v1alpha1
 
 import (
-	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -28,10 +27,13 @@ import (
 type ObjectStoreSpec struct {
 	// Endpoint is the S3-compatible endpoint URL
 	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:Pattern=^https?://.*
 	Endpoint string `json:"endpoint"`
 
 	// Bucket is the name of the S3 bucket to use
 	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinLength=3
+	// +kubebuilder:validation:MaxLength=63
 	Bucket string `json:"bucket"`
 
 	// Region is the S3 region (optional for some providers)
@@ -40,40 +42,53 @@ type ObjectStoreSpec struct {
 
 	// CredentialsSecret references the secret containing AWS credentials
 	// +kubebuilder:validation:Required
-	CredentialsSecret corev1.LocalObjectReference `json:"credentialsSecret"`
+	CredentialsSecret SecretReference `json:"credentialsSecret"`
+}
+
+// SecretReference contains the reference to a secret
+type SecretReference struct {
+	// Name is the name of the secret
+	// +kubebuilder:validation:Required
+	Name string `json:"name"`
+
+	// AccessKeyField is the field in the secret containing the access key
+	// +kubebuilder:default=access-key
+	AccessKeyField string `json:"accessKeyField,omitempty"`
+
+	// SecretKeyField is the field in the secret containing the secret key
+	// +kubebuilder:default=secret-key
+	SecretKeyField string `json:"secretKeyField,omitempty"`
 }
 
 // EncryptionSpec defines the encryption configuration for the catalog
 type EncryptionSpec struct {
-	// Provider specifies the encryption provider (e.g., "aws-kms")
-	// +kubebuilder:validation:Enum=aws-kms;none
-	Provider string `json:"provider"`
-
-	// KeyID is the identifier for the encryption key
-	// +optional
-	KeyID string `json:"keyId,omitempty"`
+	// KMSKeyID is the AWS KMS key ID for encryption
+	// +kubebuilder:validation:Required
+	KMSKeyID string `json:"kmsKeyId"`
 }
 
 // BackupPolicySpec defines the backup configuration
 type BackupPolicySpec struct {
-	// Schedule in Cron format
-	// +optional
-	Schedule string `json:"schedule,omitempty"`
+	// Schedule is the cron expression for backups
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:Pattern=^(@(annually|yearly|monthly|weekly|daily|hourly|reboot))|(@every (\d+(ns|us|µs|ms|s|m|h))+)|((((\d+,)+\d+|(\d+(\/|-)\d+)|\d+|\*) ?){5,7})$
+	Schedule string `json:"schedule"`
 
-	// RetentionDays specifies how long to keep backups
-	// +optional
+	// RetentionDays is the number of days to retain backups
 	// +kubebuilder:validation:Minimum=1
-	RetentionDays int32 `json:"retentionDays,omitempty"`
+	// +kubebuilder:default=7
+	RetentionDays int `json:"retentionDays,omitempty"`
 }
 
 // DuckLakeCatalogSpec defines the desired state of DuckLakeCatalog
 type DuckLakeCatalogSpec struct {
-	// StorageClass specifies the storage class to use for the catalog PVC
+	// StorageClass is the storage class to use for the catalog PVC
 	// +kubebuilder:validation:Required
 	StorageClass string `json:"storageClass"`
 
-	// Size specifies the size of the catalog PVC
+	// Size is the size of the catalog PVC
 	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:Pattern=^([0-9]+(\.[0-9]+)?)(E|P|T|G|M|K|Ei|Pi|Ti|Gi|Mi|Ki)$
 	Size string `json:"size"`
 
 	// ObjectStore defines the S3-compatible storage configuration
