@@ -6,8 +6,6 @@ import (
 	"os"
 	"time"
 
-	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/rs/zerolog"
 	batchv1 "k8s.io/api/batch/v1"
@@ -22,7 +20,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
-	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 
 	ducklakev1alpha1 "github.com/TFMV/featherman/operator/api/v1alpha1"
@@ -376,8 +373,13 @@ func (r *DuckLakeTableReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 
 // handleDeletion handles the deletion of a DuckLakeTable
 func (r *DuckLakeTableReconciler) handleDeletion(ctx context.Context, table *ducklakev1alpha1.DuckLakeTable) (ctrl.Result, error) {
-	logger := log.FromContext(ctx)
-	logger.Info("handling DuckLakeTable deletion")
+	l := logger.WithValues(r.Logger,
+		"controller", "DuckLakeTable",
+		"namespace", table.Namespace,
+		"name", table.Name)
+	ctx = logger.WithContext(ctx, l)
+
+	l.Info().Msg("handling table deletion")
 
 	// Generate SQL for dropping table
 	dropSQL := fmt.Sprintf("DROP TABLE IF EXISTS %s;", table.Spec.Name)
@@ -388,6 +390,7 @@ func (r *DuckLakeTableReconciler) handleDeletion(ctx context.Context, table *duc
 		Namespace: table.Namespace,
 		Name:      table.Spec.CatalogRef,
 	}, catalog); err != nil {
+		l.Error().Err(err).Msg("failed to get catalog")
 		r.Recorder.Event(table, corev1.EventTypeWarning, "CatalogNotFound", err.Error())
 		return ctrl.Result{}, fmt.Errorf("failed to get catalog: %w", err)
 	}
@@ -405,6 +408,7 @@ func (r *DuckLakeTableReconciler) handleDeletion(ctx context.Context, table *duc
 	// Create the job
 	job, err := r.JobManager.CreateJob(op)
 	if err != nil {
+		l.Error().Err(err).Msg("failed to create cleanup job")
 		r.Recorder.Event(table, corev1.EventTypeWarning, "CleanupFailed", err.Error())
 		return ctrl.Result{}, fmt.Errorf("failed to create cleanup job: %w", err)
 	}
@@ -417,10 +421,11 @@ func (r *DuckLakeTableReconciler) handleDeletion(ctx context.Context, table *duc
 	// Remove finalizer
 	controllerutil.RemoveFinalizer(table, "ducklaketable.featherman.dev")
 	if err := r.Update(ctx, table); err != nil {
+		l.Error().Err(err).Msg("failed to remove finalizer")
 		return ctrl.Result{}, fmt.Errorf("failed to remove finalizer: %w", err)
 	}
 
-	logger.Info("handled DuckLakeTable deletion successfully")
+	l.Info().Msg("handled table deletion successfully")
 	return ctrl.Result{}, nil
 }
 
@@ -429,12 +434,14 @@ func (r *DuckLakeTableReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	// Initialize with default pod template
 	r.PodTemplate = config.DefaultPodTemplateConfig()
 
-	// Initialize logger
-	r.Logger = &zerolog.Logger{}
-	*r.Logger = zerolog.New(zerolog.ConsoleWriter{
-		Out:        os.Stdout,
-		TimeFormat: time.RFC3339Nano,
-	}).With().Timestamp().Logger()
+	// Initialize logger if not already set
+	if r.Logger == nil {
+		logger := zerolog.New(zerolog.ConsoleWriter{
+			Out:        os.Stdout,
+			TimeFormat: time.RFC3339Nano,
+		}).With().Timestamp().Logger()
+		r.Logger = &logger
+	}
 
 	// Initialize retry config
 	r.RetryConfig = retry.DefaultRetryConfig
@@ -447,21 +454,11 @@ func (r *DuckLakeTableReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	r.Lifecycle = duckdb.NewLifecycleManager(r.Client, kubeClient)
 
 	// Initialize consistency checker
-	s3Client := s3.NewFromConfig(aws.Config{
-		Region: "us-east-1", // Default region, will be overridden by endpoint resolver
-		EndpointResolverWithOptions: aws.EndpointResolverWithOptionsFunc(func(service, region string, options ...interface{}) (aws.Endpoint, error) {
-			return aws.Endpoint{
-				URL:               "http://minio:9000", // Default MinIO endpoint
-				SigningRegion:     "us-east-1",
-				HostnameImmutable: true,
-			}, nil
-		}),
-		Credentials: credentials.NewStaticCredentialsProvider(
-			"minioadmin", // Default MinIO access key
-			"minioadmin", // Default MinIO secret key
-			"",
-		),
-	})
+	s3Config, err := storage.GetS3Config(context.Background())
+	if err != nil {
+		return fmt.Errorf("failed to get S3 config: %w", err)
+	}
+	s3Client := s3.NewFromConfig(s3Config)
 
 	r.Consistency = storage.NewConsistencyChecker(r.Client, s3Client).
 		WithTimeout(storage.DefaultTimeout).
@@ -487,7 +484,12 @@ func (r *DuckLakeTableReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			case <-cleanupCtx.Done():
 				return
 			case <-ticker.C:
-				continue
+				// Run cleanup on ticker
+				if err := r.Lifecycle.CleanupJobs(cleanupCtx, "", labels.SelectorFromSet(labels.Set{
+					"app.kubernetes.io/managed-by": "featherman",
+				})); err != nil {
+					r.Logger.Error().Err(err).Msg("failed to cleanup jobs")
+				}
 			}
 		}
 	}()
@@ -523,12 +525,16 @@ func (r *DuckLakeTableReconciler) findTablesForConfigMap(ctx context.Context, ob
 	if data, ok := configMap.Data["config"]; ok {
 		if newTemplate, err := config.LoadFromConfigMap(data); err == nil {
 			r.PodTemplate = newTemplate
+		} else {
+			r.Logger.Error().Err(err).Msg("failed to load pod template config")
+			return nil
 		}
 	}
 
 	// List all DuckLakeTables
 	var tables ducklakev1alpha1.DuckLakeTableList
 	if err := r.List(ctx, &tables); err != nil {
+		r.Logger.Error().Err(err).Msg("failed to list tables")
 		return nil
 	}
 

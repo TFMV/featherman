@@ -6,89 +6,160 @@ import (
 )
 
 var (
-	// TableOperations tracks table operations (create/update/delete)
-	TableOperations = prometheus.NewCounterVec(
+	// Reconciliation metrics
+	reconciliationTotal = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
-			Name: "ducklake_table_operations_total",
-			Help: "Number of table operations by type and status",
+			Name: "featherman_reconciliation_total",
+			Help: "Total number of reconciliations per controller",
+		},
+		[]string{"controller", "result"},
+	)
+
+	reconciliationDuration = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "featherman_reconciliation_duration_seconds",
+			Help:    "Duration of reconciliation in seconds",
+			Buckets: prometheus.ExponentialBuckets(0.01, 2, 10),
+		},
+		[]string{"controller"},
+	)
+
+	// Job metrics
+	jobExecutionTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "featherman_job_execution_total",
+			Help: "Total number of DuckDB job executions",
+		},
+		[]string{"status"},
+	)
+
+	jobDuration = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "featherman_job_duration_seconds",
+			Help:    "Duration of DuckDB jobs in seconds",
+			Buckets: prometheus.ExponentialBuckets(0.1, 2, 10),
 		},
 		[]string{"operation", "status"},
 	)
 
-	// JobDuration tracks job execution time
-	JobDuration = prometheus.NewHistogramVec(
+	// Table operation metrics
+	tableOperationTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "featherman_table_operation_total",
+			Help: "Total number of table operations",
+		},
+		[]string{"operation", "status"},
+	)
+
+	// Storage metrics
+	s3OperationTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "featherman_s3_operation_total",
+			Help: "Total number of S3 operations",
+		},
+		[]string{"operation", "status"},
+	)
+
+	s3OperationDuration = prometheus.NewHistogramVec(
 		prometheus.HistogramOpts{
-			Name:    "ducklake_job_duration_seconds",
-			Help:    "Duration of DuckDB jobs",
-			Buckets: []float64{1, 5, 10, 30, 60, 120, 300, 600},
+			Name:    "featherman_s3_operation_duration_seconds",
+			Help:    "Duration of S3 operations in seconds",
+			Buckets: prometheus.ExponentialBuckets(0.01, 2, 10),
 		},
-		[]string{"type", "status"},
+		[]string{"operation"},
 	)
 
-	// StorageUsage tracks Parquet file sizes
-	StorageUsage = prometheus.NewGaugeVec(
+	// Catalog metrics
+	catalogSize = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
-			Name: "ducklake_storage_bytes",
-			Help: "Storage usage in bytes by table",
-		},
-		[]string{"table", "type"}, // type can be "parquet" or "catalog"
-	)
-
-	// CatalogBackupStatus tracks backup operations
-	CatalogBackupStatus = prometheus.NewGaugeVec(
-		prometheus.GaugeOpts{
-			Name: "ducklake_catalog_backup_status",
-			Help: "Status of the last backup operation (1 = success, 0 = failure)",
+			Name: "featherman_catalog_size_bytes",
+			Help: "Size of DuckDB catalog files in bytes",
 		},
 		[]string{"catalog"},
 	)
 
-	// TablePartitionCount tracks number of partitions
-	TablePartitionCount = prometheus.NewGaugeVec(
-		prometheus.GaugeOpts{
-			Name: "ducklake_table_partition_count",
-			Help: "Number of partitions in a table",
+	// Backup metrics
+	backupTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "featherman_backup_total",
+			Help: "Total number of backup operations",
 		},
-		[]string{"table"},
+		[]string{"catalog", "status"},
+	)
+
+	backupDuration = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "featherman_backup_duration_seconds",
+			Help:    "Duration of backup operations in seconds",
+			Buckets: prometheus.ExponentialBuckets(1, 2, 10),
+		},
+		[]string{"catalog"},
 	)
 )
 
 func init() {
 	// Register metrics with the controller-runtime metrics registry
 	metrics.Registry.MustRegister(
-		TableOperations,
-		JobDuration,
-		StorageUsage,
-		CatalogBackupStatus,
-		TablePartitionCount,
+		reconciliationTotal,
+		reconciliationDuration,
+		jobExecutionTotal,
+		jobDuration,
+		tableOperationTotal,
+		s3OperationTotal,
+		s3OperationDuration,
+		catalogSize,
+		backupTotal,
+		backupDuration,
 	)
 }
 
-// RecordTableOperation records a table operation metric
-func RecordTableOperation(operation, status string) {
-	TableOperations.WithLabelValues(operation, status).Inc()
-}
-
-// RecordJobDuration records a job duration metric
-func RecordJobDuration(jobType, status string, duration float64) {
-	JobDuration.WithLabelValues(jobType, status).Observe(duration)
-}
-
-// UpdateStorageUsage updates storage usage metrics
-func UpdateStorageUsage(table, storageType string, bytes float64) {
-	StorageUsage.WithLabelValues(table, storageType).Set(bytes)
-}
-
-// UpdateCatalogBackupStatus updates catalog backup status
-func UpdateCatalogBackupStatus(catalog string, success bool) {
-	value := 0.0
-	if success {
-		value = 1.0
+// RecordReconciliation records reconciliation metrics
+func RecordReconciliation(controller string, success bool, duration float64) {
+	result := "success"
+	if !success {
+		result = "failure"
 	}
-	CatalogBackupStatus.WithLabelValues(catalog).Set(value)
+	reconciliationTotal.WithLabelValues(controller, result).Inc()
+	reconciliationDuration.WithLabelValues(controller).Observe(duration)
 }
 
-// UpdateTablePartitionCount updates partition count for a table
-func UpdateTablePartitionCount(table string, count float64) {
-	TablePartitionCount.WithLabelValues(table).Set(count)
+// RecordJobExecution records job execution metrics
+func RecordJobExecution(status string, duration float64, operation string) {
+	jobExecutionTotal.WithLabelValues(status).Inc()
+	jobDuration.WithLabelValues(operation, status).Observe(duration)
+}
+
+// RecordJobDuration records job duration metrics
+func RecordJobDuration(operation, status string, duration float64) {
+	jobDuration.WithLabelValues(operation, status).Observe(duration)
+}
+
+// RecordTableOperation records table operation metrics
+func RecordTableOperation(operation, status string) {
+	tableOperationTotal.WithLabelValues(operation, status).Inc()
+}
+
+// RecordS3Operation records S3 operation metrics
+func RecordS3Operation(operation string, success bool, duration float64) {
+	status := "success"
+	if !success {
+		status = "failure"
+	}
+	s3OperationTotal.WithLabelValues(operation, status).Inc()
+	s3OperationDuration.WithLabelValues(operation).Observe(duration)
+}
+
+// SetCatalogSize sets the current catalog size
+func SetCatalogSize(catalog string, sizeBytes float64) {
+	catalogSize.WithLabelValues(catalog).Set(sizeBytes)
+}
+
+// RecordBackup records backup operation metrics
+func RecordBackup(catalog string, success bool, duration float64) {
+	status := "success"
+	if !success {
+		status = "failure"
+	}
+	backupTotal.WithLabelValues(catalog, status).Inc()
+	backupDuration.WithLabelValues(catalog).Observe(duration)
 }
