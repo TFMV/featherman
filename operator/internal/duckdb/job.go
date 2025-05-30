@@ -1,182 +1,317 @@
 package duckdb
 
 import (
-	"context"
 	"fmt"
+	"path"
 
-	"github.com/TFMV/featherman/operator/internal/config"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/kubernetes"
+
+	ducklakev1alpha1 "github.com/TFMV/featherman/operator/api/v1alpha1"
+	"github.com/TFMV/featherman/operator/internal/config"
 )
 
-// JobConfig represents the configuration for a DuckDB job
+// OperationType represents the type of DuckDB operation
+type OperationType string
+
+const (
+	// OperationTypeRead represents a read-only operation
+	OperationTypeRead OperationType = "read"
+	// OperationTypeWrite represents a write operation
+	OperationTypeWrite OperationType = "write"
+)
+
+// Operation represents a DuckDB operation configuration
+type Operation struct {
+	metav1.TypeMeta
+	metav1.ObjectMeta
+	Type          OperationType
+	SQL           string
+	Table         *ducklakev1alpha1.DuckLakeTable
+	Catalog       *ducklakev1alpha1.DuckLakeCatalog
+	PodTemplate   *config.PodTemplateConfig
+	JobNameSuffix string
+}
+
+// DeepCopyObject implements runtime.Object
+func (o *Operation) DeepCopyObject() runtime.Object {
+	if o == nil {
+		return nil
+	}
+	out := new(Operation)
+	o.DeepCopyInto(out)
+	return out
+}
+
+// DeepCopyInto copies all properties of this object into another object of the same type
+func (o *Operation) DeepCopyInto(out *Operation) {
+	*out = *o
+	out.TypeMeta = o.TypeMeta
+	o.ObjectMeta.DeepCopyInto(&out.ObjectMeta)
+	if o.Table != nil {
+		out.Table = o.Table.DeepCopy()
+	}
+	if o.Catalog != nil {
+		out.Catalog = o.Catalog.DeepCopy()
+	}
+	if o.PodTemplate != nil {
+		out.PodTemplate = o.PodTemplate.DeepCopy()
+	}
+}
+
+// JobConfig contains the configuration for a DuckDB job
 type JobConfig struct {
-	// Name of the job
-	Name string
-	// Namespace where the job will run
-	Namespace string
-	// SQL script to execute
-	SQL string
-	// CatalogPath is the path to the DuckDB catalog file
-	CatalogPath string
-	// ObjectStore configuration
-	ObjectStore ObjectStoreConfig
-	// Resources for the DuckDB container
-	Resources corev1.ResourceRequirements
-	// ReadOnly indicates if this is a read-only operation
-	ReadOnly bool
-	// OwnerReference for the job
-	OwnerReference *metav1.OwnerReference
-	// PodTemplate defines custom pod configuration
-	PodTemplate *config.PodTemplateConfig
+	ReadOnly        bool
+	Resources       corev1.ResourceRequirements
+	SecurityContext *corev1.SecurityContext
+	InitContainers  []corev1.Container
+	Sidecars        []corev1.Container
+	Volumes         []corev1.Volume
+	VolumeMounts    []corev1.VolumeMount
+	EnvFrom         []corev1.EnvFromSource
+	Env             []corev1.EnvVar
 }
 
-// ObjectStoreConfig contains S3-compatible storage configuration
-type ObjectStoreConfig struct {
-	// Endpoint is the S3-compatible endpoint
-	Endpoint string
-	// Bucket is the S3 bucket name
-	Bucket string
-	// Region is the S3 region (optional)
-	Region string
-	// CredentialsSecret references the secret containing credentials
-	CredentialsSecret corev1.LocalObjectReference
+// SetResources sets the resource requirements
+func (c *JobConfig) SetResources(resources corev1.ResourceRequirements) {
+	c.Resources = resources
 }
 
-// JobManager handles DuckDB job lifecycle
-type JobManager interface {
-	// CreateJob creates a new DuckDB job
-	CreateJob(ctx context.Context, config JobConfig) (*batchv1.Job, error)
-	// DeleteJob deletes a DuckDB job
-	DeleteJob(ctx context.Context, namespace, name string) error
-	// GetJob gets a DuckDB job
-	GetJob(ctx context.Context, namespace, name string) (*batchv1.Job, error)
+// SetSecurityContext sets the security context
+func (c *JobConfig) SetSecurityContext(securityContext *corev1.SecurityContext) {
+	c.SecurityContext = securityContext
 }
 
-// NewJobConfig creates a new JobConfig with default values
-func NewJobConfig(name, namespace string) *JobConfig {
+// AddVolumes adds volumes to the configuration
+func (c *JobConfig) AddVolumes(volumes []corev1.Volume) {
+	c.Volumes = append(c.Volumes, volumes...)
+}
+
+// AddVolumeMounts adds volume mounts to the configuration
+func (c *JobConfig) AddVolumeMounts(mounts []corev1.VolumeMount) {
+	c.VolumeMounts = append(c.VolumeMounts, mounts...)
+}
+
+// AddEnv adds environment variables to the configuration
+func (c *JobConfig) AddEnv(env []corev1.EnvVar) {
+	c.Env = append(c.Env, env...)
+}
+
+// AddEnvFrom adds environment from sources to the configuration
+func (c *JobConfig) AddEnvFrom(envFrom []corev1.EnvFromSource) {
+	c.EnvFrom = append(c.EnvFrom, envFrom...)
+}
+
+// DefaultReadJobConfig returns the default configuration for read jobs
+func DefaultReadJobConfig() *JobConfig {
 	return &JobConfig{
-		Name:      name,
-		Namespace: namespace,
+		ReadOnly: true,
 		Resources: corev1.ResourceRequirements{
 			Requests: corev1.ResourceList{
 				corev1.ResourceCPU:    resource.MustParse("100m"),
 				corev1.ResourceMemory: resource.MustParse("256Mi"),
 			},
 			Limits: corev1.ResourceList{
-				corev1.ResourceCPU:    resource.MustParse("1"),
+				corev1.ResourceCPU:    resource.MustParse("500m"),
 				corev1.ResourceMemory: resource.MustParse("1Gi"),
+			},
+		},
+		SecurityContext: &corev1.SecurityContext{
+			ReadOnlyRootFilesystem: &[]bool{true}[0],
+			RunAsNonRoot:           &[]bool{true}[0],
+			RunAsUser:              &[]int64{1000}[0],
+		},
+	}
+}
+
+// DefaultWriteJobConfig returns the default configuration for write jobs
+func DefaultWriteJobConfig() *JobConfig {
+	return &JobConfig{
+		ReadOnly: false,
+		Resources: corev1.ResourceRequirements{
+			Requests: corev1.ResourceList{
+				corev1.ResourceCPU:    resource.MustParse("500m"),
+				corev1.ResourceMemory: resource.MustParse("1Gi"),
+			},
+			Limits: corev1.ResourceList{
+				corev1.ResourceCPU:    resource.MustParse("2"),
+				corev1.ResourceMemory: resource.MustParse("4Gi"),
+			},
+		},
+		SecurityContext: &corev1.SecurityContext{
+			ReadOnlyRootFilesystem: &[]bool{false}[0],
+			RunAsNonRoot:           &[]bool{true}[0],
+			RunAsUser:              &[]int64{1000}[0],
+		},
+	}
+}
+
+// JobManager manages DuckDB job operations
+type JobManager struct {
+	k8sClient kubernetes.Interface
+}
+
+// NewJobManager creates a new job manager
+func NewJobManager(k8sClient kubernetes.Interface) *JobManager {
+	return &JobManager{
+		k8sClient: k8sClient,
+	}
+}
+
+// CreateJob creates a Kubernetes Job for a DuckDB operation
+func (m *JobManager) CreateJob(op *Operation) (*batchv1.Job, error) {
+	if op == nil {
+		return nil, fmt.Errorf("operation cannot be nil")
+	}
+
+	return op.CreateJob()
+}
+
+// CreateJob creates a Kubernetes Job for a DuckDB operation
+func (op *Operation) CreateJob() (*batchv1.Job, error) {
+	// Determine job configuration based on operation type
+	var jobConfig *JobConfig
+	switch op.Type {
+	case OperationTypeRead:
+		jobConfig = DefaultReadJobConfig()
+	case OperationTypeWrite:
+		jobConfig = DefaultWriteJobConfig()
+	default:
+		return nil, fmt.Errorf("unsupported operation type: %s", op.Type)
+	}
+
+	// Apply pod template configuration
+	if op.PodTemplate != nil {
+		if err := op.PodTemplate.ApplyToJobConfig(jobConfig); err != nil {
+			return nil, fmt.Errorf("failed to apply pod template: %w", err)
+		}
+	}
+
+	// Get object store environment variables
+	objectStoreEnv := op.GetObjectStoreEnv()
+	jobConfig.AddEnv(objectStoreEnv)
+
+	// Create the job
+	job := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      fmt.Sprintf("%s-%s-%s", op.Table.Name, string(op.Type), op.JobNameSuffix),
+			Namespace: op.Table.Namespace,
+			Labels: map[string]string{
+				"app.kubernetes.io/name":        "featherman",
+				"app.kubernetes.io/component":   "duckdb",
+				"app.kubernetes.io/operation":   string(op.Type),
+				"ducklake.featherman.dev/table": op.Table.Name,
+			},
+		},
+		Spec: batchv1.JobSpec{
+			BackoffLimit: &[]int32{3}[0],
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: map[string]string{
+						"app.kubernetes.io/name":        "featherman",
+						"app.kubernetes.io/component":   "duckdb",
+						"app.kubernetes.io/operation":   string(op.Type),
+						"ducklake.featherman.dev/table": op.Table.Name,
+					},
+				},
+				Spec: corev1.PodSpec{
+					RestartPolicy: corev1.RestartPolicyOnFailure,
+					Containers: []corev1.Container{
+						{
+							Name:  "duckdb",
+							Image: "duckdb/duckdb:latest",
+							Command: []string{
+								"duckdb",
+								path.Join("/catalog", op.Catalog.Spec.CatalogPath),
+								"-c",
+								op.SQL,
+							},
+							Resources:       jobConfig.Resources,
+							SecurityContext: jobConfig.SecurityContext,
+							VolumeMounts: append([]corev1.VolumeMount{
+								{
+									Name:      "catalog",
+									MountPath: "/catalog",
+									ReadOnly:  jobConfig.ReadOnly,
+								},
+							}, jobConfig.VolumeMounts...),
+							Env:     jobConfig.Env,
+							EnvFrom: jobConfig.EnvFrom,
+						},
+					},
+					InitContainers: jobConfig.InitContainers,
+					Volumes: append([]corev1.Volume{
+						{
+							Name: "catalog",
+							VolumeSource: corev1.VolumeSource{
+								PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+									ClaimName: fmt.Sprintf("%s-catalog", op.Catalog.Name),
+									ReadOnly:  jobConfig.ReadOnly,
+								},
+							},
+						},
+					}, jobConfig.Volumes...),
+				},
+			},
+		},
+	}
+
+	return job, nil
+}
+
+// GetObjectStoreEnv returns environment variables for object store configuration
+func (op *Operation) GetObjectStoreEnv() []corev1.EnvVar {
+	var objectStore *ducklakev1alpha1.ObjectStoreSpec
+	if op.Table.Spec.ObjectStore != nil {
+		objectStore = op.Table.Spec.ObjectStore
+	} else {
+		objectStore = &op.Catalog.Spec.ObjectStore
+	}
+
+	return []corev1.EnvVar{
+		{
+			Name:  "DUCKDB_S3_ENDPOINT",
+			Value: objectStore.Endpoint,
+		},
+		{
+			Name:  "DUCKDB_S3_REGION",
+			Value: objectStore.Region,
+		},
+		{
+			Name: "DUCKDB_S3_ACCESS_KEY_ID",
+			ValueFrom: &corev1.EnvVarSource{
+				SecretKeyRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{
+						Name: objectStore.CredentialsSecret.Name,
+					},
+					Key: objectStore.CredentialsSecret.AccessKeyField,
+				},
+			},
+		},
+		{
+			Name: "DUCKDB_S3_SECRET_ACCESS_KEY",
+			ValueFrom: &corev1.EnvVarSource{
+				SecretKeyRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{
+						Name: objectStore.CredentialsSecret.Name,
+					},
+					Key: objectStore.CredentialsSecret.SecretKeyField,
+				},
 			},
 		},
 	}
 }
 
-// CreateJobSpec creates a Job specification for DuckDB
-func CreateJobSpec(config JobConfig) (*batchv1.Job, error) {
-	if config.Name == "" || config.Namespace == "" {
-		return nil, fmt.Errorf("job name and namespace are required")
-	}
+// IsJobComplete checks if a job is complete
+func IsJobComplete(job *batchv1.Job) bool {
+	return job != nil && job.Status.Succeeded > 0
+}
 
-	// Create init container for flock
-	initContainer := corev1.Container{
-		Name:  "init-flock",
-		Image: "busybox:latest",
-		Command: []string{
-			"sh",
-			"-c",
-			fmt.Sprintf("flock %s.lock -c 'touch %s'", config.CatalogPath, config.CatalogPath),
-		},
-		VolumeMounts: []corev1.VolumeMount{
-			{
-				Name:      "catalog",
-				MountPath: "/catalog",
-			},
-		},
-	}
-
-	// Create main DuckDB container
-	mainContainer := corev1.Container{
-		Name:  "duckdb",
-		Image: "duckdb/duckdb:latest", // TODO: Make configurable
-		Command: []string{
-			"duckdb",
-			config.CatalogPath,
-		},
-		Args: []string{
-			"-c",
-			config.SQL,
-		},
-		Resources: config.Resources,
-		VolumeMounts: []corev1.VolumeMount{
-			{
-				Name:      "catalog",
-				MountPath: "/catalog",
-				ReadOnly:  config.ReadOnly,
-			},
-		},
-		Env: []corev1.EnvVar{
-			{
-				Name: "AWS_ACCESS_KEY_ID",
-				ValueFrom: &corev1.EnvVarSource{
-					SecretKeyRef: &corev1.SecretKeySelector{
-						LocalObjectReference: config.ObjectStore.CredentialsSecret,
-						Key:                  "access-key",
-					},
-				},
-			},
-			{
-				Name: "AWS_SECRET_ACCESS_KEY",
-				ValueFrom: &corev1.EnvVarSource{
-					SecretKeyRef: &corev1.SecretKeySelector{
-						LocalObjectReference: config.ObjectStore.CredentialsSecret,
-						Key:                  "secret-key",
-					},
-				},
-			},
-			{
-				Name:  "AWS_ENDPOINT_URL",
-				Value: config.ObjectStore.Endpoint,
-			},
-			{
-				Name:  "AWS_REGION",
-				Value: config.ObjectStore.Region,
-			},
-		},
-	}
-
-	// Create the Job specification
-	job := &batchv1.Job{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      config.Name,
-			Namespace: config.Namespace,
-		},
-		Spec: batchv1.JobSpec{
-			Template: corev1.PodTemplateSpec{
-				Spec: corev1.PodSpec{
-					InitContainers: []corev1.Container{initContainer},
-					Containers:     []corev1.Container{mainContainer},
-					RestartPolicy:  corev1.RestartPolicyOnFailure,
-					Volumes: []corev1.Volume{
-						{
-							Name: "catalog",
-							VolumeSource: corev1.VolumeSource{
-								PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
-									ClaimName: "catalog-pvc", // TODO: Make configurable
-								},
-							},
-						},
-					},
-				},
-			},
-		},
-	}
-
-	// Apply pod template configuration if provided
-	if config.PodTemplate != nil {
-		config.PodTemplate.ApplyToPodSpec(&job.Spec.Template.Spec)
-	}
-
-	return job, nil
+// IsJobFailed checks if a job has failed
+func IsJobFailed(job *batchv1.Job) bool {
+	return job != nil && job.Status.Failed > 0
 }
