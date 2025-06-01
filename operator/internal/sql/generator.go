@@ -133,7 +133,7 @@ func (g *Generator) GenerateTableSQL(table *ducklakev1alpha1.DuckLakeTable) (str
 
 	// Configure Parquet settings
 	sb.WriteString(fmt.Sprintf("COPY %s TO 's3://%s/%s' (\n", table.Spec.Name, table.Spec.ObjectStore.Bucket, table.Spec.Location))
-	sb.WriteString(fmt.Sprintf("  FORMAT 'parquet',\n"))
+	sb.WriteString("  FORMAT 'parquet',\n")
 	sb.WriteString(fmt.Sprintf("  COMPRESSION '%s'", table.Spec.Format.Compression))
 
 	// Add partitioning

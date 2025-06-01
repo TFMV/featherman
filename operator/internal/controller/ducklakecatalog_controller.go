@@ -217,29 +217,40 @@ func (r *DuckLakeCatalogReconciler) handleDeletion(ctx context.Context, catalog 
 	l := logger.FromContext(ctx)
 	l.Info().Msg("handling DuckLakeCatalog deletion")
 
-	// Check if PVC exists
-	pvc := &corev1.PersistentVolumeClaim{}
 	pvcName := fmt.Sprintf("%s-catalog", catalog.Name)
-	err := r.Get(ctx, client.ObjectKey{Namespace: catalog.Namespace, Name: pvcName}, pvc)
+	pvc := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      pvcName,
+			Namespace: catalog.Namespace,
+		},
+	}
+
+	// Attempt to delete the PVC associated with the DuckLakeCatalog.
+	err := r.Delete(ctx, pvc)
+
+	// If an error occurs during PVC deletion, and it's not because the PVC is already gone,
+	// then we should log the error and requeue the reconciliation to try again.
 	if err != nil && !errors.IsNotFound(err) {
-		return ctrl.Result{}, fmt.Errorf("failed to get PVC: %w", err)
+		l.Error().Err(err).Str("pvcName", pvcName).Msg("failed to delete PVC during DuckLakeCatalog deletion")
+		// Requeue to ensure the PVC deletion is retried.
+		return ctrl.Result{Requeue: true}, fmt.Errorf("failed to delete PVC %s: %w", pvcName, err)
 	}
 
-	// Delete PVC if it exists
-	if err == nil {
-		if err := r.Delete(ctx, pvc); err != nil && !errors.IsNotFound(err) {
-			return ctrl.Result{}, fmt.Errorf("failed to delete PVC: %w", err)
+	// If we reach here, either the PVC deletion was successful, or the PVC was already not found.
+	// In either case, the PVC is considered handled, and we can proceed to remove the finalizer
+	// from the DuckLakeCatalog resource.
+	if controllerutil.ContainsFinalizer(catalog, "ducklakecatalog.featherman.dev") {
+		controllerutil.RemoveFinalizer(catalog, "ducklakecatalog.featherman.dev")
+		if err := r.Update(ctx, catalog); err != nil {
+			l.Error().Err(err).Msg("failed to remove finalizer from DuckLakeCatalog")
+			// If updating the catalog to remove the finalizer fails, requeue.
+			return ctrl.Result{}, fmt.Errorf("failed to remove finalizer: %w", err)
 		}
-		r.Recorder.Event(catalog, corev1.EventTypeNormal, "PVCDeleted", "Deleted catalog PVC")
+		r.Recorder.Event(catalog, corev1.EventTypeNormal, "FinalizerRemoved", "Successfully removed finalizer after PVC handling.")
+		l.Info().Str("catalogName", catalog.Name).Msg("Successfully removed finalizer from DuckLakeCatalog")
 	}
 
-	// Remove finalizer
-	controllerutil.RemoveFinalizer(catalog, "ducklakecatalog.featherman.dev")
-	if err := r.Update(ctx, catalog); err != nil {
-		return ctrl.Result{}, fmt.Errorf("failed to remove finalizer: %w", err)
-	}
-
-	l.Info().Msg("handled DuckLakeCatalog deletion successfully")
+	l.Info().Str("catalogName", catalog.Name).Msg("DuckLakeCatalog deletion process completed successfully")
 	return ctrl.Result{}, nil
 }
 
@@ -283,32 +294,39 @@ func (r *DuckLakeCatalogReconciler) reconcilePVC(ctx context.Context, catalog *d
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *DuckLakeCatalogReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	// Initialize logger
-	r.Logger = &zerolog.Logger{}
-	*r.Logger = zerolog.New(zerolog.ConsoleWriter{
-		Out:        os.Stdout,
-		TimeFormat: time.RFC3339Nano,
-	}).With().Timestamp().Logger()
+	// Initialize logger if not set
+	if r.Logger == nil {
+		r.Logger = &zerolog.Logger{}
+		*r.Logger = zerolog.New(zerolog.ConsoleWriter{
+			Out:        os.Stdout,
+			TimeFormat: time.RFC3339Nano,
+		}).With().Timestamp().Logger()
+	}
 
 	// Initialize retry config
 	r.RetryConfig = retry.DefaultRetryConfig
 
-	// Initialize S3 client
-	customEndpoint := "http://minio.minio-test.svc.cluster.local:9000"
-	s3Client := awss3.NewFromConfig(aws.Config{
-		Region: "us-east-1",
-		Credentials: credentials.NewStaticCredentialsProvider(
-			"minioadmin", // Default MinIO access key
-			"minioadmin", // Default MinIO secret key
-			"",
-		),
-	}, func(o *awss3.Options) {
-		o.BaseEndpoint = &customEndpoint
-		o.UsePathStyle = true
-	})
+	// Initialize S3 client only if Storage is not already set (for testing)
+	if r.Storage == nil {
+		customEndpoint := "http://minio.minio-test.svc.cluster.local:9000"
+		s3Client := awss3.NewFromConfig(aws.Config{
+			Region: "us-east-1",
+			Credentials: credentials.NewStaticCredentialsProvider(
+				"minioadmin", // Default MinIO access key
+				"minioadmin", // Default MinIO secret key
+				"",
+			),
+		}, func(o *awss3.Options) {
+			o.BaseEndpoint = &customEndpoint
+			o.UsePathStyle = true
+		})
+		r.Storage = storage.NewObjectStore(s3Client)
+	}
 
 	// Initialize backup manager
-	r.Backup = backup.NewBackupManager(r.Client, s3Client, r.Logger)
+	// Note: For now, we're using a nil s3Client for backup manager since it's not used in MVP
+	// This will need to be properly initialized when backup functionality is implemented
+	r.Backup = backup.NewBackupManager(r.Client, nil, r.Logger)
 
 	// Add cleanup on shutdown
 	if err := mgr.Add(manager.RunnableFunc(func(ctx context.Context) error {

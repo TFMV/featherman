@@ -11,7 +11,6 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/envtest"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
@@ -22,7 +21,6 @@ import (
 var (
 	cfg       *rest.Config
 	k8sClient client.Client
-	testEnv   *envtest.Environment
 	testSetup *setup.TestEnv
 	ctx       context.Context
 	cancel    context.CancelFunc

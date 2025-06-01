@@ -4,7 +4,7 @@ Featherman brings DuckDB's powerful DuckLake functionality to Kubernetes, enabli
 
 > This project is in early development. Any contributions are appreciated.
 
-## Features (In Progress
+## Features (In Progress)
 
 - 🦆 **DuckDB-Native**: Leverages DuckDB's simplicity and performance
 - 🎯 **Declarative**: Define your data lake structure using Kubernetes CRDs

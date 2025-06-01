@@ -101,22 +101,11 @@ func (r *DuckLakeCatalog) ValidateDelete() (admission.Warnings, error) {
 
 // isValidStorageSize validates storage size format
 func isValidStorageSize(size string) bool {
-	// Parse the storage size using k8s resource quantity
 	quantity, err := resource.ParseQuantity(size)
 	if err != nil {
 		return false
 	}
 
-	// Ensure size is positive
-	if quantity.Sign() <= 0 {
-		return false
-	}
-
-	// Ensure size is at least 1Gi
-	minSize := resource.MustParse("1Gi")
-	if quantity.Cmp(minSize) < 0 {
-		return false
-	}
-
-	return true
+	minSize, _ := resource.ParseQuantity("1Gi")
+	return quantity.Cmp(minSize) >= 0
 }
