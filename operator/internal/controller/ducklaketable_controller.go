@@ -15,6 +15,7 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -27,6 +28,7 @@ import (
 	"github.com/TFMV/featherman/operator/internal/duckdb"
 	"github.com/TFMV/featherman/operator/internal/logger"
 	"github.com/TFMV/featherman/operator/internal/metrics"
+	"github.com/TFMV/featherman/operator/internal/pool"
 	"github.com/TFMV/featherman/operator/internal/retry"
 	"github.com/TFMV/featherman/operator/internal/sql"
 	"github.com/TFMV/featherman/operator/internal/storage"
@@ -37,13 +39,21 @@ type DuckLakeTableReconciler struct {
 	client.Client
 	Scheme      *runtime.Scheme
 	Recorder    record.EventRecorder
+	Logger      *zerolog.Logger
 	JobManager  *duckdb.JobManager
 	SQLGen      *sql.Generator
 	PodTemplate *config.PodTemplateConfig
 	Consistency *storage.ConsistencyChecker
-	Logger      *zerolog.Logger
 	RetryConfig retry.RetryConfig
 	Lifecycle   *duckdb.LifecycleManager
+	PoolManager PoolManager
+	Config      *rest.Config
+	K8sClient   kubernetes.Interface
+}
+
+// PoolManager provides access to warm pod pools
+type PoolManager interface {
+	GetPoolManager(namespace, name string) (*pool.Manager, bool)
 }
 
 // +kubebuilder:rbac:groups=ducklake.featherman.dev,resources=ducklaketables,verbs=get;list;watch;create;update;patch;delete
@@ -316,6 +326,79 @@ func (r *DuckLakeTableReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 			JobNameSuffix: "create",
 		}
 
+		// Try to use warm pod if available
+		if r.PoolManager != nil {
+			poolName := table.Annotations["ducklake.featherman.dev/pool"]
+			if poolName == "" {
+				poolName = "default-pool" // Use default pool if not specified
+			}
+
+			if poolMgr, ok := r.PoolManager.GetPoolManager(table.Namespace, poolName); ok {
+				l.Info().Str("pool", poolName).Msg("attempting to use warm pod")
+
+				// Request a warm pod
+				resources := corev1.ResourceRequirements{}
+				if r.PodTemplate != nil && r.PodTemplate.Resources != nil {
+					resources = *r.PodTemplate.Resources
+				}
+				pod, err := poolMgr.RequestPod(ctx, catalog.Name,
+					resources,
+					30*time.Second)
+
+				if err == nil && pod != nil {
+					l.Info().Str("pod", pod.Name).Msg("acquired warm pod")
+
+					// Create executor
+					kubeClient, err := kubernetes.NewForConfig(r.Config)
+					if err != nil {
+						l.Error().Err(err).Msg("failed to create kubernetes client")
+						_ = poolMgr.ReleasePod(ctx, pod.Name)
+					} else {
+						executor := pool.NewExecutor(kubeClient, r.Config, l)
+
+						// Execute SQL
+						startTime := time.Now()
+						output, err := executor.ExecuteQuery(ctx, pod, op.SQL, 5*time.Minute)
+						duration := time.Since(startTime)
+
+						// Release pod
+						_ = poolMgr.ReleasePod(ctx, pod.Name)
+
+						if err != nil {
+							l.Error().Err(err).Msg("warm pod execution failed, falling back to job")
+							metrics.RecordTableOperation("warm_pod_exec", "failed")
+							// Fall through to job creation
+						} else {
+							l.Info().
+								Str("pod", pod.Name).
+								Dur("duration", duration).
+								Int("outputBytes", len(output)).
+								Msg("warm pod execution succeeded")
+
+							metrics.RecordTableOperation("warm_pod_exec", "succeeded")
+
+							// Update status
+							table.Status.Phase = ducklakev1alpha1.TablePhaseSucceeded
+							table.Status.LastModified = &metav1.Time{Time: time.Now()}
+							table.Status.ObservedGeneration = table.Generation
+							if err := r.Status().Update(ctx, table); err != nil {
+								l.Error().Err(err).Msg("failed to update status")
+								return ctrl.Result{}, fmt.Errorf("failed to update status: %w", err)
+							}
+
+							r.Recorder.Event(table, corev1.EventTypeNormal, "WarmPodExecuted",
+								fmt.Sprintf("Successfully executed on warm pod %s", pod.Name))
+
+							return ctrl.Result{}, nil
+						}
+					}
+				} else {
+					l.Warn().Err(err).Msg("failed to acquire warm pod, falling back to job")
+					metrics.RecordTableOperation("warm_pod_request", "failed")
+				}
+			}
+		}
+
 		// Create the job with retries
 		var job *batchv1.Job
 		createOp := func(ctx context.Context) error {
@@ -446,6 +529,9 @@ func (r *DuckLakeTableReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	// Initialize with default pod template
 	r.PodTemplate = config.DefaultPodTemplateConfig()
 
+	// Store the config
+	r.Config = mgr.GetConfig()
+
 	// Initialize logger if not already set
 	if r.Logger == nil {
 		logger := zerolog.New(zerolog.ConsoleWriter{
@@ -459,11 +545,14 @@ func (r *DuckLakeTableReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	r.RetryConfig = retry.DefaultRetryConfig
 
 	// Initialize lifecycle manager
-	kubeClient, err := kubernetes.NewForConfig(mgr.GetConfig())
-	if err != nil {
-		return fmt.Errorf("failed to create kubernetes client: %w", err)
+	if r.K8sClient == nil {
+		kubeClient, err := kubernetes.NewForConfig(mgr.GetConfig())
+		if err != nil {
+			return fmt.Errorf("failed to create kubernetes client: %w", err)
+		}
+		r.K8sClient = kubeClient
 	}
-	r.Lifecycle = duckdb.NewLifecycleManager(r.Client, kubeClient)
+	r.Lifecycle = duckdb.NewLifecycleManager(r.Client, r.K8sClient)
 
 	// Initialize consistency checker
 	s3Config, err := storage.GetS3Config(context.Background())

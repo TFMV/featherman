@@ -1,0 +1,39 @@
+apiVersion: ducklake.featherman.dev/v1alpha1
+kind: DuckLakePool
+metadata:
+  name: default-pool
+  namespace: featherman-system
+spec:
+  minSize: 2
+  maxSize: 10
+  targetUtilization: "0.8"
+
+  template:
+    image: datacatering/duckdb:v1.3.0
+    imagePullPolicy: IfNotPresent
+    resources:
+      requests:
+        memory: "2Gi"
+        cpu: "1"
+      limits:
+        memory: "4Gi"
+        cpu: "2"
+
+  lifecyclePolicies:
+    maxIdleTime: "5m"
+    maxLifetime: "1h"
+    maxQueries: 100
+
+  scalingBehavior:
+    scaleUpRate: 2
+    scaleDownRate: 1
+    scaleInterval: "30s"
+    stabilizationWindow: "2m"
+
+  catalogRef:
+    name: main-catalog
+    readOnly: false
+
+  metrics:
+    enabled: true
+    port: 9091

@@ -25,9 +25,35 @@ rules:
   - ""
   resources:
   - persistentvolumeclaims
+  - pods
   verbs:
   - create
   - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - ""
+  resources:
+  - pods/exec
+  verbs:
+  - create
+- apiGroups:
+  - ""
+  resources:
+  - pods/status
+  verbs:
+  - get
+  - patch
+  - update
+- apiGroups:
+  - ""
+  resources:
+  - serviceaccounts
+  verbs:
+  - create
   - get
   - list
   - patch
@@ -50,6 +76,7 @@ rules:
   - ducklake.featherman.dev
   resources:
   - ducklakecatalogs
+  - ducklakepools
   - ducklaketables
   verbs:
   - create
@@ -63,6 +90,7 @@ rules:
   - ducklake.featherman.dev
   resources:
   - ducklakecatalogs/finalizers
+  - ducklakepools/finalizers
   - ducklaketables/finalizers
   verbs:
   - update
@@ -70,11 +98,24 @@ rules:
   - ducklake.featherman.dev
   resources:
   - ducklakecatalogs/status
+  - ducklakepools/status
   - ducklaketables/status
   verbs:
   - get
   - patch
   - update
+- apiGroups:
+  - rbac.authorization.k8s.io
+  resources:
+  - rolebindings
+  - roles
+  verbs:
+  - create
+  - get
+  - list
+  - patch
+  - update
+  - watch
 - apiGroups:
   - storage.k8s.io
   resources:
