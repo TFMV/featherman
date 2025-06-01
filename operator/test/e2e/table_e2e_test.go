@@ -27,7 +27,77 @@ var _ = Describe("DuckLakeTable Controller", func() {
 	)
 
 	BeforeEach(func() {
-		// No need to copy MinIO credentials secret since we're using the same namespace
+		ctx := context.Background()
+
+		// Clean up any existing table from previous runs
+		existingTable := &ducklakev1alpha1.DuckLakeTable{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      TableName,
+				Namespace: CatalogNamespace,
+			},
+		}
+		err := k8sClient.Get(ctx, types.NamespacedName{
+			Name:      TableName,
+			Namespace: CatalogNamespace,
+		}, existingTable)
+		if err == nil {
+			// If table exists, delete it
+			_ = k8sClient.Delete(ctx, existingTable)
+			// Wait for table to be deleted (with timeout)
+			Eventually(func() error {
+				return k8sClient.Get(ctx, types.NamespacedName{
+					Name:      TableName,
+					Namespace: CatalogNamespace,
+				}, existingTable)
+			}, timeout/2, interval).ShouldNot(Succeed())
+		}
+
+		// Clean up any existing catalog from previous runs
+		existingCatalog := &ducklakev1alpha1.DuckLakeCatalog{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      CatalogName,
+				Namespace: CatalogNamespace,
+			},
+		}
+		err = k8sClient.Get(ctx, types.NamespacedName{
+			Name:      CatalogName,
+			Namespace: CatalogNamespace,
+		}, existingCatalog)
+		if err == nil {
+			// If catalog exists, delete it
+			_ = k8sClient.Delete(ctx, existingCatalog)
+			// Wait for catalog to be deleted (with timeout)
+			Eventually(func() error {
+				return k8sClient.Get(ctx, types.NamespacedName{
+					Name:      CatalogName,
+					Namespace: CatalogNamespace,
+				}, existingCatalog)
+			}, timeout/2, interval).ShouldNot(Succeed())
+		}
+
+		// Clean up any PVCs from previous runs
+		pvcName := fmt.Sprintf("%s-catalog", CatalogName)
+		existingPVC := &corev1.PersistentVolumeClaim{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      pvcName,
+				Namespace: CatalogNamespace,
+			},
+		}
+		err = k8sClient.Get(ctx, types.NamespacedName{
+			Name:      pvcName,
+			Namespace: CatalogNamespace,
+		}, existingPVC)
+		if err == nil {
+			// If PVC exists, delete it
+			_ = k8sClient.Delete(ctx, existingPVC)
+			// Wait for PVC to be deleted (with timeout)
+			Eventually(func() error {
+				return k8sClient.Get(ctx, types.NamespacedName{
+					Name:      pvcName,
+					Namespace: CatalogNamespace,
+				}, existingPVC)
+			}, timeout/2, interval).ShouldNot(Succeed())
+		}
 	})
 
 	AfterEach(func() {

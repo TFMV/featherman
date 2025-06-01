@@ -12,17 +12,20 @@ import (
 	ducklakev1alpha1 "github.com/TFMV/featherman/operator/api/v1alpha1"
 	"github.com/TFMV/featherman/operator/internal/controller"
 	"github.com/TFMV/featherman/operator/internal/duckdb"
+	"github.com/TFMV/featherman/operator/internal/metrics"
 	"github.com/TFMV/featherman/operator/internal/sql"
 	"github.com/TFMV/featherman/operator/internal/storage"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/prometheus/client_golang/prometheus"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 	// to ensure that exec-entrypoint and run can make use of them.
 	"k8s.io/client-go/kubernetes"
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 
+	"github.com/rs/zerolog"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
@@ -30,6 +33,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/certwatcher"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
+	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 	"sigs.k8s.io/controller-runtime/pkg/metrics/filters"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
@@ -180,6 +184,9 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Initialize metrics with the controller-runtime registry
+	metrics.InitMetrics(ctrlmetrics.Registry.(prometheus.Registerer))
+
 	// Create JobManager
 	k8sClient, err := kubernetes.NewForConfig(mgr.GetConfig())
 	if err != nil {
@@ -242,12 +249,27 @@ func main() {
 	}
 
 	tableReconciler := &controller.DuckLakeTableReconciler{
-		Client:     mgr.GetClient(),
-		Scheme:     mgr.GetScheme(),
-		Recorder:   mgr.GetEventRecorderFor("ducklaketable-controller"),
-		JobManager: jobManager,
-		SQLGen:     sqlGen,
+		Client:      mgr.GetClient(),
+		Scheme:      mgr.GetScheme(),
+		Recorder:    mgr.GetEventRecorderFor("ducklaketable-controller"),
+		JobManager:  jobManager,
+		SQLGen:      sqlGen,
+		PoolManager: nil, // Will be set after pool reconciler is created
 	}
+
+	// Create logger for pool controller
+	logger := zerolog.New(os.Stdout).With().Timestamp().Logger()
+
+	poolReconciler := &controller.DuckLakePoolReconciler{
+		Client:    mgr.GetClient(),
+		Scheme:    mgr.GetScheme(),
+		Recorder:  mgr.GetEventRecorderFor("ducklakepool-controller"),
+		Logger:    &logger,
+		K8sClient: k8sClient,
+	}
+
+	// Now set the pool manager reference
+	tableReconciler.PoolManager = poolReconciler
 
 	if err := catalogReconciler.SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "DuckLakeCatalog")
@@ -256,6 +278,11 @@ func main() {
 
 	if err := tableReconciler.SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "DuckLakeTable")
+		os.Exit(1)
+	}
+
+	if err := poolReconciler.SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "DuckLakePool")
 		os.Exit(1)
 	}
 

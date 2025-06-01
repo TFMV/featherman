@@ -1,0 +1,1 @@
+test/utils/utils.go:11:2: should not use dot imports (ST1001)
