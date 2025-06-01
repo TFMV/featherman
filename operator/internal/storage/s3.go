@@ -52,18 +52,9 @@ type s3Client struct {
 func NewS3Client(ctx context.Context, cfg S3Config) (S3Client, error) {
 	logger := log.FromContext(ctx)
 	logger.Info("creating S3 client", "endpoint", cfg.Endpoint)
-	// TODO: Update to use the new AWS SDK v2
-	customResolver := aws.EndpointResolverWithOptionsFunc(func(service, region string, options ...interface{}) (aws.Endpoint, error) {
-		return aws.Endpoint{
-			URL:               cfg.Endpoint,
-			SigningRegion:     cfg.Region,
-			HostnameImmutable: true,
-		}, nil
-	})
 
 	awsCfg, err := config.LoadDefaultConfig(ctx,
 		config.WithRegion(cfg.Region),
-		config.WithEndpointResolverWithOptions(customResolver),
 		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(
 			cfg.AccessKeyID,
 			cfg.SecretAccessKey,
@@ -74,7 +65,16 @@ func NewS3Client(ctx context.Context, cfg S3Config) (S3Client, error) {
 		return nil, fmt.Errorf("failed to load AWS config: %w", err)
 	}
 
-	client := s3.NewFromConfig(awsCfg)
+	// Create S3 client with custom endpoint if provided
+	var s3Options []func(*s3.Options)
+	if cfg.Endpoint != "" {
+		s3Options = append(s3Options, func(o *s3.Options) {
+			o.BaseEndpoint = aws.String(cfg.Endpoint)
+			o.UsePathStyle = true
+		})
+	}
+
+	client := s3.NewFromConfig(awsCfg, s3Options...)
 	return &s3Client{
 		client: client,
 		bucket: cfg.Bucket,
