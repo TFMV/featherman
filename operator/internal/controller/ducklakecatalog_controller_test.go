@@ -17,7 +17,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	feathermanv1alpha1 "github.com/TFMV/featherman/operator/api/v1alpha1"
-	"github.com/rs/zerolog"
 )
 
 const (
@@ -40,12 +39,6 @@ var _ = Describe("DuckLakeCatalog Controller", func() {
 	BeforeEach(func() {
 		ctx, cancel = context.WithCancel(context.Background())
 
-		// Initialize logger
-		logger := zerolog.New(zerolog.ConsoleWriter{
-			Out:        GinkgoWriter,
-			TimeFormat: "15:04:05",
-		}).With().Timestamp().Logger()
-
 		// Increment test counter
 		testCount++
 
@@ -55,7 +48,6 @@ var _ = Describe("DuckLakeCatalog Controller", func() {
 			Scheme:   k8sManager.GetScheme(),
 			Storage:  mockS3,
 			Recorder: record.NewFakeRecorder(100),
-			Logger:   &logger,
 		}
 		// DON'T call SetupWithManager - we want manual reconciliation only
 

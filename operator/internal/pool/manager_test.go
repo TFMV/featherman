@@ -7,7 +7,6 @@ import (
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
-	"github.com/rs/zerolog"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -30,7 +29,6 @@ var _ = Describe("Pool Manager", func() {
 		cancel   context.CancelFunc
 		manager  *pool.Manager
 		scheme   *runtime.Scheme
-		logger   *zerolog.Logger
 		duckPool *ducklakev1alpha1.DuckLakePool
 	)
 
@@ -39,10 +37,6 @@ var _ = Describe("Pool Manager", func() {
 		scheme = runtime.NewScheme()
 		_ = corev1.AddToScheme(scheme)
 		_ = ducklakev1alpha1.AddToScheme(scheme)
-
-		// Create logger
-		l := zerolog.New(GinkgoWriter).With().Timestamp().Logger()
-		logger = &l
 
 		// Create pool spec
 		duckPool = &ducklakev1alpha1.DuckLakePool{
@@ -108,7 +102,6 @@ var _ = Describe("Pool Manager", func() {
 				nil, // client.Client not needed for this test
 				fakeK8s,
 				scheme,
-				logger,
 				duckPool,
 				"default",
 				&rest.Config{},
@@ -152,7 +145,6 @@ var _ = Describe("Pool Manager", func() {
 				nil,
 				fakeK8s,
 				scheme,
-				logger,
 				duckPool,
 				"default",
 				&rest.Config{},
@@ -173,7 +165,6 @@ var _ = Describe("Pool Manager", func() {
 				nil,
 				fakeK8s,
 				scheme,
-				logger,
 				duckPool,
 				"default",
 				&rest.Config{},

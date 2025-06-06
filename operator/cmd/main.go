@@ -12,6 +12,7 @@ import (
 	ducklakev1alpha1 "github.com/TFMV/featherman/operator/api/v1alpha1"
 	"github.com/TFMV/featherman/operator/internal/controller"
 	"github.com/TFMV/featherman/operator/internal/duckdb"
+	"github.com/TFMV/featherman/operator/internal/logger"
 	"github.com/TFMV/featherman/operator/internal/metrics"
 	"github.com/TFMV/featherman/operator/internal/sql"
 	"github.com/TFMV/featherman/operator/internal/storage"
@@ -19,20 +20,19 @@ import (
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/rs/zerolog"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 	// to ensure that exec-entrypoint and run can make use of them.
 	"k8s.io/client-go/kubernetes"
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 
-	"github.com/rs/zerolog"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/certwatcher"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
-	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 	"sigs.k8s.io/controller-runtime/pkg/metrics/filters"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
@@ -40,8 +40,7 @@ import (
 )
 
 var (
-	scheme   = runtime.NewScheme()
-	setupLog = ctrl.Log.WithName("setup")
+	scheme = runtime.NewScheme()
 )
 
 func init() {
@@ -61,6 +60,8 @@ func main() {
 	var enableHTTP2 bool
 	var tlsOpts []func(*tls.Config)
 	var catalogPath string
+	var logLevel string
+	var logFormat string
 
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "The address the metric endpoint binds to.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
@@ -79,22 +80,24 @@ func main() {
 	flag.BoolVar(&enableHTTP2, "enable-http2", false,
 		"If set, HTTP/2 will be enabled for the metrics and webhook servers")
 	flag.StringVar(&catalogPath, "catalog-path", "/var/lib/featherman", "Path to store DuckDB catalog files")
-	opts := zap.Options{
-		Development: true,
-	}
-	opts.BindFlags(flag.CommandLine)
+	flag.StringVar(&logLevel, "log-level", "info", "Log level (debug, info, warn, error)")
+	flag.StringVar(&logFormat, "log-format", "console", "Log format (json or console)")
 	flag.Parse()
 
-	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
+	// Initialize enhanced logger
+	logger.Configure(logger.Config{
+		ServiceName: "featherman-operator",
+		Environment: os.Getenv("ENVIRONMENT"),
+		LogLevel:    logLevel,
+		Format:      logFormat,
+	})
+
+	// Set up controller-runtime logger
+	ctrl.SetLogger(logger.NewControllerRuntimeLogger())
 
 	// if the enable-http2 flag is false (the default), http/2 should be disabled
-	// due to its vulnerabilities. More specifically, disabling http/2 will
-	// prevent from being vulnerable to the HTTP/2 Stream Cancellation and
-	// Rapid Reset CVEs. For more information see:
-	// - https://github.com/advisories/GHSA-qppj-fm5r-hxr3
-	// - https://github.com/advisories/GHSA-4374-p667-p6c8
 	disableHTTP2 := func(c *tls.Config) {
-		setupLog.Info("disabling http/2")
+		logger.Info().Msg("disabling http/2")
 		c.NextProtos = []string{"http/1.1"}
 	}
 
@@ -109,8 +112,11 @@ func main() {
 	webhookTLSOpts := tlsOpts
 
 	if len(webhookCertPath) > 0 {
-		setupLog.Info("Initializing webhook certificate watcher using provided certificates",
-			"webhook-cert-path", webhookCertPath, "webhook-cert-name", webhookCertName, "webhook-cert-key", webhookCertKey)
+		logger.Info().
+			Str("webhook-cert-path", webhookCertPath).
+			Str("webhook-cert-name", webhookCertName).
+			Str("webhook-cert-key", webhookCertKey).
+			Msg("Initializing webhook certificate watcher using provided certificates")
 
 		var err error
 		webhookCertWatcher, err = certwatcher.New(
@@ -118,7 +124,7 @@ func main() {
 			filepath.Join(webhookCertPath, webhookCertKey),
 		)
 		if err != nil {
-			setupLog.Error(err, "Failed to initialize webhook certificate watcher")
+			logger.Error().Err(err).Msg("Failed to initialize webhook certificate watcher")
 			os.Exit(1)
 		}
 
@@ -153,8 +159,11 @@ func main() {
 	// generate self-signed certificates for the metrics server. While convenient for development and testing,
 	// this setup is not recommended for production.
 	if len(metricsCertPath) > 0 {
-		setupLog.Info("Initializing metrics certificate watcher using provided certificates",
-			"metrics-cert-path", metricsCertPath, "metrics-cert-name", metricsCertName, "metrics-cert-key", metricsCertKey)
+		logger.Info().
+			Str("metrics-cert-path", metricsCertPath).
+			Str("metrics-cert-name", metricsCertName).
+			Str("metrics-cert-key", metricsCertKey).
+			Msg("Initializing metrics certificate watcher using provided certificates")
 
 		var err error
 		metricsCertWatcher, err = certwatcher.New(
@@ -162,7 +171,7 @@ func main() {
 			filepath.Join(metricsCertPath, metricsCertKey),
 		)
 		if err != nil {
-			setupLog.Error(err, "to initialize metrics certificate watcher", "error", err)
+			logger.Error().Err(err).Msg("to initialize metrics certificate watcher")
 			os.Exit(1)
 		}
 
@@ -180,7 +189,7 @@ func main() {
 		LeaderElectionID:       "featherman-operator-lock",
 	})
 	if err != nil {
-		setupLog.Error(err, "unable to start manager")
+		logger.Error().Err(err).Msg("unable to start manager")
 		os.Exit(1)
 	}
 
@@ -190,7 +199,7 @@ func main() {
 	// Create JobManager
 	k8sClient, err := kubernetes.NewForConfig(mgr.GetConfig())
 	if err != nil {
-		setupLog.Error(err, "unable to create kubernetes client")
+		logger.Error().Err(err).Msg("unable to create kubernetes client")
 		os.Exit(1)
 	}
 	jobManager := duckdb.NewJobManager(k8sClient)
@@ -214,12 +223,12 @@ func main() {
 
 	// Add health checks
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
-		setupLog.Error(err, "unable to set up health check")
+		logger.Error().Err(err).Msg("unable to set up health check")
 		os.Exit(1)
 	}
 
 	if err := mgr.AddReadyzCheck("readyz", healthz.Ping); err != nil {
-		setupLog.Error(err, "unable to set up ready check")
+		logger.Error().Err(err).Msg("unable to set up ready check")
 		os.Exit(1)
 	}
 
@@ -229,14 +238,14 @@ func main() {
 		_, err := s3Client.ListBuckets(ctx, &s3.ListBucketsInput{})
 		return err
 	}); err != nil {
-		setupLog.Error(err, "unable to set up S3 health check")
+		logger.Error().Err(err).Msg("unable to set up S3 health check")
 		os.Exit(1)
 	}
 
 	if err := mgr.AddReadyzCheck("kubernetes", func(_ *http.Request) error {
 		return k8sClient.RESTClient().Get().AbsPath("/healthz").Do(context.Background()).Error()
 	}); err != nil {
-		setupLog.Error(err, "unable to set up Kubernetes health check")
+		logger.Error().Err(err).Msg("unable to set up Kubernetes health check")
 		os.Exit(1)
 	}
 
@@ -272,39 +281,48 @@ func main() {
 	tableReconciler.PoolManager = poolReconciler
 
 	if err := catalogReconciler.SetupWithManager(mgr); err != nil {
-		setupLog.Error(err, "unable to create controller", "controller", "DuckLakeCatalog")
+		logger.Error().
+			Err(err).
+			Str("controller", "DuckLakeCatalog").
+			Msg("unable to create controller")
 		os.Exit(1)
 	}
 
 	if err := tableReconciler.SetupWithManager(mgr); err != nil {
-		setupLog.Error(err, "unable to create controller", "controller", "DuckLakeTable")
+		logger.Error().
+			Err(err).
+			Str("controller", "DuckLakeTable").
+			Msg("unable to create controller")
 		os.Exit(1)
 	}
 
 	if err := poolReconciler.SetupWithManager(mgr); err != nil {
-		setupLog.Error(err, "unable to create controller", "controller", "DuckLakePool")
+		logger.Error().
+			Err(err).
+			Str("controller", "DuckLakePool").
+			Msg("unable to create controller")
 		os.Exit(1)
 	}
 
 	if metricsCertWatcher != nil {
-		setupLog.Info("Adding metrics certificate watcher to manager")
+		logger.Info().Msg("Adding metrics certificate watcher to manager")
 		if err := mgr.Add(metricsCertWatcher); err != nil {
-			setupLog.Error(err, "unable to add metrics certificate watcher to manager")
+			logger.Error().Err(err).Msg("unable to add metrics certificate watcher to manager")
 			os.Exit(1)
 		}
 	}
 
 	if webhookCertWatcher != nil {
-		setupLog.Info("Adding webhook certificate watcher to manager")
+		logger.Info().Msg("Adding webhook certificate watcher to manager")
 		if err := mgr.Add(webhookCertWatcher); err != nil {
-			setupLog.Error(err, "unable to add webhook certificate watcher to manager")
+			logger.Error().Err(err).Msg("unable to add webhook certificate watcher to manager")
 			os.Exit(1)
 		}
 	}
 
-	setupLog.Info("starting manager")
+	logger.Info().Msg("starting manager")
 	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
-		setupLog.Error(err, "problem running manager")
+		logger.Error().Err(err).Msg("problem running manager")
 		os.Exit(1)
 	}
 }

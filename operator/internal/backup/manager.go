@@ -314,3 +314,43 @@ func (m *BackupManager) CleanupOldBackups(ctx context.Context, catalog *ducklake
 
 	return nil
 }
+
+// CancelBackup cancels any scheduled backups for a catalog
+func (m *BackupManager) CancelBackup(ctx context.Context, catalog *ducklakev1alpha1.DuckLakeCatalog) {
+	l := logger.FromContext(ctx)
+	l.Debug().
+		Str("catalog", catalog.Name).
+		Str("namespace", catalog.Namespace).
+		Msg("Canceling scheduled backups")
+
+	// Stop all cron jobs (we'll recreate them for other catalogs when needed)
+	m.cron.Stop()
+	m.cron = cron.New()
+	m.cron.Start()
+
+	// List all catalogs
+	var catalogs ducklakev1alpha1.DuckLakeCatalogList
+	if err := m.client.List(ctx, &catalogs); err != nil {
+		l.Error().
+			Err(err).
+			Msg("Failed to list catalogs while rescheduling backups")
+		return
+	}
+
+	// Reschedule backups for remaining catalogs
+	for i := range catalogs.Items {
+		remainingCatalog := &catalogs.Items[i]
+		// Skip the catalog being deleted and any catalogs marked for deletion
+		if remainingCatalog.Name == catalog.Name && remainingCatalog.Namespace == catalog.Namespace ||
+			!remainingCatalog.DeletionTimestamp.IsZero() {
+			continue
+		}
+		if err := m.ScheduleBackup(ctx, remainingCatalog); err != nil {
+			l.Error().
+				Err(err).
+				Str("catalog", remainingCatalog.Name).
+				Str("namespace", remainingCatalog.Namespace).
+				Msg("Failed to reschedule backup")
+		}
+	}
+}

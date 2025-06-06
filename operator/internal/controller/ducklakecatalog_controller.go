@@ -3,13 +3,8 @@ package controller
 import (
 	"context"
 	"fmt"
-	"os"
 	"time"
 
-	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/credentials"
-	awss3 "github.com/aws/aws-sdk-go-v2/service/s3"
-	"github.com/rs/zerolog"
 	corev1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -20,7 +15,6 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
-	"sigs.k8s.io/controller-runtime/pkg/manager"
 
 	ducklakev1alpha1 "github.com/TFMV/featherman/operator/api/v1alpha1"
 	"github.com/TFMV/featherman/operator/internal/backup"
@@ -35,7 +29,6 @@ type DuckLakeCatalogReconciler struct {
 	client.Client
 	Scheme      *runtime.Scheme
 	Recorder    record.EventRecorder
-	Logger      *zerolog.Logger
 	RetryConfig retry.RetryConfig
 	Backup      *backup.BackupManager
 	Storage     storage.ObjectStore
@@ -54,11 +47,12 @@ type DuckLakeCatalogReconciler struct {
 
 // Reconcile handles DuckLakeCatalog resources
 func (r *DuckLakeCatalogReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	l := logger.WithValues(r.Logger,
-		"controller", "DuckLakeCatalog",
-		"namespace", req.Namespace,
-		"name", req.Name)
-	ctx = logger.WithContext(ctx, l)
+	l := logger.FromContext(ctx).With().
+		Str("controller", "DuckLakeCatalog").
+		Str("namespace", req.Namespace).
+		Str("name", req.Name).
+		Logger()
+	ctx = logger.WithContext(ctx, &l)
 
 	startTime := time.Now()
 	defer func() {
@@ -71,101 +65,130 @@ func (r *DuckLakeCatalogReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		if errors.IsNotFound(err) {
 			return ctrl.Result{}, nil
 		}
-		l.Error().Err(err).Msg("failed to get DuckLakeCatalog")
+		l.Error().Err(err).Msg("Failed to get DuckLakeCatalog")
 		return ctrl.Result{}, fmt.Errorf("failed to get DuckLakeCatalog: %w", err)
 	}
+
+	l.Info().
+		Str("phase", string(catalog.Status.Phase)).
+		Bool("deletion", !catalog.DeletionTimestamp.IsZero()).
+		Msg("Starting reconciliation")
 
 	// Handle deletion
 	if !catalog.DeletionTimestamp.IsZero() {
 		metrics.RecordTableOperation("delete", "started")
+		l.Info().Msg("Processing DuckLakeCatalog deletion")
 		result, err := r.handleDeletion(ctx, catalog)
 		if err != nil {
 			metrics.RecordTableOperation("delete", "failed")
+			l.Error().Err(err).Msg("Failed to process deletion")
 			return result, err
 		}
 		metrics.RecordTableOperation("delete", "succeeded")
+		l.Info().Msg("Successfully processed DuckLakeCatalog deletion")
 		return result, nil
 	}
 
 	// Add finalizer
 	if !controllerutil.ContainsFinalizer(catalog, "ducklakecatalog.featherman.dev") {
+		l.Info().Msg("Adding finalizer")
 		controllerutil.AddFinalizer(catalog, "ducklakecatalog.featherman.dev")
 		if err := r.Update(ctx, catalog); err != nil {
-			l.Error().Err(err).Msg("failed to add finalizer")
+			l.Error().Err(err).Msg("Failed to add finalizer")
 			return ctrl.Result{}, fmt.Errorf("failed to add finalizer: %w", err)
 		}
 	}
 
 	// Validate storage class
+	l.Debug().Str("storageClass", catalog.Spec.StorageClass).Msg("Validating storage class")
 	storageClass := &storagev1.StorageClass{}
 	if err := r.Get(ctx, client.ObjectKey{Name: catalog.Spec.StorageClass}, storageClass); err != nil {
 		if errors.IsNotFound(err) {
-			l.Error().Str("storageClass", catalog.Spec.StorageClass).Msg("storage class not found")
+			l.Error().
+				Str("storageClass", catalog.Spec.StorageClass).
+				Msg("Storage class not found")
 			r.setCondition(catalog, "Ready", metav1.ConditionFalse, "StorageClassNotFound", fmt.Sprintf("Storage class %s not found", catalog.Spec.StorageClass))
 			catalog.Status.Phase = ducklakev1alpha1.CatalogPhaseFailed
 			if err := r.Status().Update(ctx, catalog); err != nil {
-				l.Error().Err(err).Msg("failed to update status")
+				l.Error().Err(err).Msg("Failed to update status")
 			}
 			return ctrl.Result{}, fmt.Errorf("storage class %s not found", catalog.Spec.StorageClass)
 		}
+		l.Error().Err(err).Msg("Failed to get storage class")
 		return ctrl.Result{}, fmt.Errorf("failed to get storage class: %w", err)
 	}
 
-	// Validate S3 credentials and connection
+	// Validate S3 connection
+	l.Debug().Msg("Validating S3 connection")
 	if err := r.validateS3Connection(ctx, catalog); err != nil {
-		l.Error().Err(err).Msg("failed to validate S3 connection")
+		l.Error().Err(err).Msg("Failed to validate S3 connection")
 		r.setCondition(catalog, "Ready", metav1.ConditionFalse, "S3ConnectionFailed", fmt.Sprintf("Failed to connect to S3: %v", err))
 		catalog.Status.Phase = ducklakev1alpha1.CatalogPhaseFailed
 		if err := r.Status().Update(ctx, catalog); err != nil {
-			l.Error().Err(err).Msg("failed to update status")
+			l.Error().Err(err).Msg("Failed to update status")
 		}
 		return ctrl.Result{}, fmt.Errorf("failed to validate S3 connection: %w", err)
 	}
 
 	// Create or update PVC
+	l.Debug().Msg("Reconciling PVC")
 	pvc, err := r.reconcilePVC(ctx, catalog)
 	if err != nil {
-		l.Error().Err(err).Msg("failed to reconcile PVC")
+		l.Error().Err(err).Msg("Failed to reconcile PVC")
 		r.setCondition(catalog, "Ready", metav1.ConditionFalse, "PVCReconcileFailed", fmt.Sprintf("Failed to reconcile PVC: %v", err))
 		catalog.Status.Phase = ducklakev1alpha1.CatalogPhaseFailed
 		if err := r.Status().Update(ctx, catalog); err != nil {
-			l.Error().Err(err).Msg("failed to update status")
+			l.Error().Err(err).Msg("Failed to update status")
 		}
 		metrics.RecordTableOperation("reconcile_pvc", "failed")
 		r.Recorder.Event(catalog, corev1.EventTypeWarning, "PVCReconcileFailed", err.Error())
 		return ctrl.Result{}, fmt.Errorf("failed to reconcile PVC: %w", err)
 	}
 	metrics.RecordTableOperation("reconcile_pvc", "succeeded")
+	l.Info().Msg("Successfully reconciled PVC")
 
 	// Update storage metrics
 	if pvc.Status.Phase == corev1.ClaimBound {
 		if quantity, ok := pvc.Status.Capacity[corev1.ResourceStorage]; ok {
 			metrics.UpdateCatalogSize(catalog.Name, float64(quantity.Value()))
+			l.Debug().
+				Str("size", quantity.String()).
+				Msg("Updated catalog size metrics")
 		}
 	}
 
 	// Schedule backup if needed
 	if catalog.Spec.BackupPolicy != nil {
+		l.Debug().
+			Str("schedule", catalog.Spec.BackupPolicy.Schedule).
+			Int("retentionDays", catalog.Spec.BackupPolicy.RetentionDays).
+			Msg("Scheduling backup")
 		if err := r.Backup.ScheduleBackup(ctx, catalog); err != nil {
-			l.Error().Err(err).Msg("failed to schedule backup")
+			l.Error().Err(err).Msg("Failed to schedule backup")
 			r.setCondition(catalog, "Ready", metav1.ConditionFalse, "BackupScheduleFailed", fmt.Sprintf("Failed to schedule backup: %v", err))
 			r.Recorder.Event(catalog, corev1.EventTypeWarning, "BackupScheduleFailed", err.Error())
 			return ctrl.Result{}, fmt.Errorf("failed to schedule backup: %w", err)
 		}
 		metrics.RecordTableOperation("reconcile_backup", "succeeded")
+		l.Info().Msg("Successfully scheduled backup")
 	}
 
 	// Update status
+	l.Debug().Msg("Updating catalog status")
 	r.setCondition(catalog, "Ready", metav1.ConditionTrue, "CatalogReady", "Catalog is ready")
 	catalog.Status.Phase = ducklakev1alpha1.CatalogPhaseSucceeded
 	catalog.Status.ObservedGeneration = catalog.Generation
 	if err := r.Status().Update(ctx, catalog); err != nil {
+		l.Error().Err(err).Msg("Failed to update status")
 		metrics.RecordTableOperation("status_update", "failed")
 		return ctrl.Result{}, fmt.Errorf("failed to update status: %w", err)
 	}
 	metrics.RecordTableOperation("status_update", "succeeded")
 
-	l.Info().Msg("reconciled DuckLakeCatalog successfully")
+	l.Info().
+		Str("phase", string(catalog.Status.Phase)).
+		Int64("generation", catalog.Generation).
+		Msg("Successfully reconciled DuckLakeCatalog")
 	return ctrl.Result{}, nil
 }
 
@@ -215,9 +238,18 @@ func (r *DuckLakeCatalogReconciler) setCondition(catalog *ducklakev1alpha1.DuckL
 // handleDeletion handles the deletion of a DuckLakeCatalog
 func (r *DuckLakeCatalogReconciler) handleDeletion(ctx context.Context, catalog *ducklakev1alpha1.DuckLakeCatalog) (ctrl.Result, error) {
 	l := logger.FromContext(ctx)
-	l.Info().Msg("handling DuckLakeCatalog deletion")
 
 	pvcName := fmt.Sprintf("%s-catalog", catalog.Name)
+	l.Info().
+		Str("pvcName", pvcName).
+		Msg("Starting DuckLakeCatalog deletion process")
+
+	// Cancel any scheduled backups
+	if catalog.Spec.BackupPolicy != nil {
+		l.Debug().Msg("Canceling scheduled backups")
+		r.Backup.CancelBackup(ctx, catalog)
+	}
+
 	pvc := &corev1.PersistentVolumeClaim{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      pvcName,
@@ -225,32 +257,40 @@ func (r *DuckLakeCatalogReconciler) handleDeletion(ctx context.Context, catalog 
 		},
 	}
 
-	// Attempt to delete the PVC associated with the DuckLakeCatalog.
+	// Attempt to delete the PVC associated with the DuckLakeCatalog
 	err := r.Delete(ctx, pvc)
-
-	// If an error occurs during PVC deletion, and it's not because the PVC is already gone,
-	// then we should log the error and requeue the reconciliation to try again.
 	if err != nil && !errors.IsNotFound(err) {
-		l.Error().Err(err).Str("pvcName", pvcName).Msg("failed to delete PVC during DuckLakeCatalog deletion")
-		// Requeue to ensure the PVC deletion is retried.
+		l.Error().
+			Err(err).
+			Str("pvcName", pvcName).
+			Msg("Failed to delete PVC during DuckLakeCatalog deletion")
 		return ctrl.Result{Requeue: true}, fmt.Errorf("failed to delete PVC %s: %w", pvcName, err)
 	}
 
-	// If we reach here, either the PVC deletion was successful, or the PVC was already not found.
-	// In either case, the PVC is considered handled, and we can proceed to remove the finalizer
-	// from the DuckLakeCatalog resource.
-	if controllerutil.ContainsFinalizer(catalog, "ducklakecatalog.featherman.dev") {
-		controllerutil.RemoveFinalizer(catalog, "ducklakecatalog.featherman.dev")
-		if err := r.Update(ctx, catalog); err != nil {
-			l.Error().Err(err).Msg("failed to remove finalizer from DuckLakeCatalog")
-			// If updating the catalog to remove the finalizer fails, requeue.
-			return ctrl.Result{}, fmt.Errorf("failed to remove finalizer: %w", err)
-		}
-		r.Recorder.Event(catalog, corev1.EventTypeNormal, "FinalizerRemoved", "Successfully removed finalizer after PVC handling.")
-		l.Info().Str("catalogName", catalog.Name).Msg("Successfully removed finalizer from DuckLakeCatalog")
+	if err == nil {
+		l.Info().
+			Str("pvcName", pvcName).
+			Msg("Successfully deleted PVC")
+	} else {
+		l.Debug().
+			Str("pvcName", pvcName).
+			Msg("PVC already deleted")
 	}
 
-	l.Info().Str("catalogName", catalog.Name).Msg("DuckLakeCatalog deletion process completed successfully")
+	// Remove finalizer
+	if controllerutil.ContainsFinalizer(catalog, "ducklakecatalog.featherman.dev") {
+		l.Debug().Msg("Removing finalizer")
+		controllerutil.RemoveFinalizer(catalog, "ducklakecatalog.featherman.dev")
+		if err := r.Update(ctx, catalog); err != nil {
+			l.Error().
+				Err(err).
+				Msg("Failed to remove finalizer from DuckLakeCatalog")
+			return ctrl.Result{}, fmt.Errorf("failed to remove finalizer: %w", err)
+		}
+		r.Recorder.Event(catalog, corev1.EventTypeNormal, "FinalizerRemoved", "Successfully removed finalizer after PVC handling")
+		l.Info().Msg("Successfully removed finalizer from DuckLakeCatalog")
+	}
+
 	return ctrl.Result{}, nil
 }
 
@@ -294,61 +334,7 @@ func (r *DuckLakeCatalogReconciler) reconcilePVC(ctx context.Context, catalog *d
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *DuckLakeCatalogReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	// Initialize logger if not set
-	if r.Logger == nil {
-		r.Logger = &zerolog.Logger{}
-		*r.Logger = zerolog.New(zerolog.ConsoleWriter{
-			Out:        os.Stdout,
-			TimeFormat: time.RFC3339Nano,
-		}).With().Timestamp().Logger()
-	}
-
-	// Initialize retry config
-	r.RetryConfig = retry.DefaultRetryConfig
-
-	// Initialize S3 client only if Storage is not already set (for testing)
-	if r.Storage == nil {
-		customEndpoint := "http://minio.minio-test.svc.cluster.local:9000"
-		s3Client := awss3.NewFromConfig(aws.Config{
-			Region: "us-east-1",
-			Credentials: credentials.NewStaticCredentialsProvider(
-				"minioadmin", // Default MinIO access key
-				"minioadmin", // Default MinIO secret key
-				"",
-			),
-		}, func(o *awss3.Options) {
-			o.BaseEndpoint = &customEndpoint
-			o.UsePathStyle = true
-		})
-		r.Storage = storage.NewObjectStore(s3Client)
-	}
-
-	// Initialize backup manager
-	// Note: For now, we're using a nil s3Client for backup manager since it's not used in MVP
-	// This will need to be properly initialized when backup functionality is implemented
-	r.Backup = backup.NewBackupManager(r.Client, nil, r.Logger)
-
-	// Add cleanup on shutdown
-	if err := mgr.Add(manager.RunnableFunc(func(ctx context.Context) error {
-		// Wait for cache to be ready
-		if !mgr.GetCache().WaitForCacheSync(ctx) {
-			return fmt.Errorf("failed to wait for caches to sync")
-		}
-
-		// Start backup manager after cache is ready
-		if err := r.Backup.Start(ctx); err != nil {
-			return fmt.Errorf("failed to start backup manager: %w", err)
-		}
-
-		<-ctx.Done()
-		r.Backup.Stop()
-		return nil
-	})); err != nil {
-		return fmt.Errorf("failed to add backup manager cleanup: %w", err)
-	}
-
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&ducklakev1alpha1.DuckLakeCatalog{}).
-		Owns(&corev1.PersistentVolumeClaim{}).
 		Complete(r)
 }

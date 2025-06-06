@@ -24,3 +24,5 @@ go.work.sum
 # env file
 .env
 operator/bin/k8s/
+art/
+.DS_Store
