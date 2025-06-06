@@ -8,7 +8,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/rs/zerolog"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -19,6 +18,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	ducklakev1alpha1 "github.com/TFMV/featherman/operator/api/v1alpha1"
+	"github.com/TFMV/featherman/operator/internal/logger"
 	"github.com/TFMV/featherman/operator/internal/metrics"
 )
 
@@ -61,7 +61,6 @@ type Manager struct {
 	client    client.Client
 	k8sClient kubernetes.Interface
 	scheme    *runtime.Scheme
-	logger    *zerolog.Logger
 	pool      *ducklakev1alpha1.DuckLakePool
 	namespace string
 	config    *rest.Config
@@ -77,7 +76,6 @@ func NewManager(
 	client client.Client,
 	k8sClient kubernetes.Interface,
 	scheme *runtime.Scheme,
-	logger *zerolog.Logger,
 	pool *ducklakev1alpha1.DuckLakePool,
 	namespace string,
 	config *rest.Config,
@@ -86,7 +84,6 @@ func NewManager(
 		client:       client,
 		k8sClient:    k8sClient,
 		scheme:       scheme,
-		logger:       logger,
 		pool:         pool,
 		namespace:    namespace,
 		config:       config,
@@ -98,7 +95,17 @@ func NewManager(
 
 // Start starts the pool manager
 func (m *Manager) Start(ctx context.Context) error {
-	m.logger.Info().Msg("starting pool manager")
+	l := logger.FromContext(ctx).With().
+		Str("pool", m.pool.Name).
+		Str("namespace", m.namespace).
+		Logger()
+	ctx = logger.WithContext(ctx, &l)
+
+	l.Info().
+		Int32("minSize", m.pool.Spec.MinSize).
+		Int32("maxSize", m.pool.Spec.MaxSize).
+		Str("scaleInterval", m.pool.Spec.ScalingBehavior.ScaleInterval.Duration.String()).
+		Msg("Starting pool manager")
 
 	// Start background workers
 	go m.scaleLoop(ctx)
@@ -107,6 +114,7 @@ func (m *Manager) Start(ctx context.Context) error {
 
 	// Initialize pool to minimum size
 	if err := m.ensureMinimumPods(ctx); err != nil {
+		l.Error().Err(err).Msg("Failed to ensure minimum pods")
 		return fmt.Errorf("failed to ensure minimum pods: %w", err)
 	}
 
@@ -117,7 +125,15 @@ func (m *Manager) Start(ctx context.Context) error {
 
 // RequestPod requests a warm pod from the pool
 func (m *Manager) RequestPod(ctx context.Context, catalog string, resources corev1.ResourceRequirements, timeout time.Duration) (*WarmPod, error) {
+	l := logger.FromContext(ctx).With().
+		Str("pool", m.pool.Name).
+		Str("namespace", m.namespace).
+		Str("catalog", catalog).
+		Str("timeout", timeout.String()).
+		Logger()
+
 	startTime := time.Now()
+	l.Debug().Msg("Requesting warm pod from pool")
 
 	req := Request{
 		ID:        fmt.Sprintf("%d", time.Now().UnixNano()),
@@ -129,10 +145,14 @@ func (m *Manager) RequestPod(ctx context.Context, catalog string, resources core
 
 	select {
 	case m.requestQueue <- req:
-		// Request queued
+		l.Debug().
+			Str("requestID", req.ID).
+			Msg("Request queued successfully")
 	case <-ctx.Done():
+		l.Debug().Msg("Request cancelled by context")
 		return nil, ctx.Err()
 	case <-time.After(timeout):
+		l.Error().Msg("Timeout queueing request")
 		return nil, fmt.Errorf("timeout queueing request")
 	}
 
@@ -141,21 +161,41 @@ func (m *Manager) RequestPod(ctx context.Context, catalog string, resources core
 	case resp := <-req.Response:
 		waitDuration := time.Since(startTime).Seconds()
 		metrics.RecordWaitDuration(m.pool.Name, m.namespace, waitDuration)
+		if resp.Err != nil {
+			l.Error().
+				Err(resp.Err).
+				Float64("waitDuration", waitDuration).
+				Msg("Failed to acquire pod")
+		} else {
+			l.Info().
+				Str("pod", resp.Pod.Name).
+				Float64("waitDuration", waitDuration).
+				Msg("Successfully acquired pod")
+		}
 		return resp.Pod, resp.Err
 	case <-ctx.Done():
+		l.Debug().Msg("Request cancelled by context while waiting")
 		return nil, ctx.Err()
 	case <-time.After(timeout):
+		l.Error().Msg("Timeout waiting for pod")
 		return nil, fmt.Errorf("timeout waiting for pod")
 	}
 }
 
 // ReleasePod releases a pod back to the pool
 func (m *Manager) ReleasePod(ctx context.Context, podName string) error {
+	l := logger.FromContext(ctx).With().
+		Str("pool", m.pool.Name).
+		Str("namespace", m.namespace).
+		Str("pod", podName).
+		Logger()
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	pod, ok := m.pods[podName]
 	if !ok {
+		l.Error().Msg("Pod not found in pool")
 		return fmt.Errorf("pod %s not found in pool", podName)
 	}
 
@@ -166,11 +206,16 @@ func (m *Manager) ReleasePod(ctx context.Context, podName string) error {
 	// Update metrics
 	metrics.RecordPodReleased(m.pool.Name, m.namespace)
 
+	l.Info().
+		Int32("queryCount", pod.QueryCount).
+		Msg("Pod released back to pool")
+
 	return nil
 }
 
 // scaleLoop handles pool scaling
 func (m *Manager) scaleLoop(ctx context.Context) {
+	l := logger.FromContext(ctx)
 	ticker := time.NewTicker(m.pool.Spec.ScalingBehavior.ScaleInterval.Duration)
 	defer ticker.Stop()
 
@@ -178,7 +223,7 @@ func (m *Manager) scaleLoop(ctx context.Context) {
 		select {
 		case <-ticker.C:
 			if err := m.evaluateScaling(ctx); err != nil {
-				m.logger.Error().Err(err).Msg("failed to evaluate scaling")
+				l.Error().Err(err).Msg("Failed to evaluate scaling")
 			}
 		case <-ctx.Done():
 			return
@@ -190,6 +235,7 @@ func (m *Manager) scaleLoop(ctx context.Context) {
 
 // lifecycleLoop handles pod lifecycle policies
 func (m *Manager) lifecycleLoop(ctx context.Context) {
+	l := logger.FromContext(ctx)
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 
@@ -197,7 +243,7 @@ func (m *Manager) lifecycleLoop(ctx context.Context) {
 		select {
 		case <-ticker.C:
 			if err := m.enforceLifecyclePolicies(ctx); err != nil {
-				m.logger.Error().Err(err).Msg("failed to enforce lifecycle policies")
+				l.Error().Err(err).Msg("Failed to enforce lifecycle policies")
 			}
 		case <-ctx.Done():
 			return
@@ -209,13 +255,21 @@ func (m *Manager) lifecycleLoop(ctx context.Context) {
 
 // requestHandler handles pod requests
 func (m *Manager) requestHandler(ctx context.Context) {
+	l := logger.FromContext(ctx)
+	l.Debug().Msg("Starting request handler")
+
 	for {
 		select {
 		case req := <-m.requestQueue:
+			l.Debug().
+				Str("requestID", req.ID).
+				Msg("Processing pod request")
 			go m.handleRequest(ctx, req)
 		case <-ctx.Done():
+			l.Debug().Msg("Request handler stopped by context")
 			return
 		case <-m.stopCh:
+			l.Debug().Msg("Request handler stopped by stop channel")
 			return
 		}
 	}
@@ -223,23 +277,47 @@ func (m *Manager) requestHandler(ctx context.Context) {
 
 // handleRequest handles a single pod request
 func (m *Manager) handleRequest(ctx context.Context, req Request) {
+	l := logger.FromContext(ctx).With().
+		Str("requestID", req.ID).
+		Logger()
+
+	l.Debug().Msg("Handling pod request")
 	pod, err := m.acquirePod(ctx, req)
 
 	select {
 	case req.Response <- Response{Pod: pod, Err: err}:
-		// Response sent
+		if err != nil {
+			l.Error().
+				Err(err).
+				Msg("Failed to acquire pod")
+		} else {
+			l.Debug().
+				Str("pod", pod.Name).
+				Msg("Successfully acquired pod")
+		}
 	case <-ctx.Done():
-		// Context cancelled
+		l.Debug().Msg("Request cancelled while sending response")
 		if pod != nil {
-			_ = m.ReleasePod(context.Background(), pod.Name)
+			if err := m.ReleasePod(context.Background(), pod.Name); err != nil {
+				l.Error().
+					Err(err).
+					Str("pod", pod.Name).
+					Msg("Failed to release pod after context cancellation")
+			}
 		}
 	}
 }
 
 // acquirePod acquires an idle pod from the pool
 func (m *Manager) acquirePod(ctx context.Context, req Request) (*WarmPod, error) {
+	l := logger.FromContext(ctx).With().
+		Str("requestID", req.ID).
+		Logger()
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
+	l.Debug().Msg("Looking for available pod")
 
 	// Find best matching idle pod
 	var bestPod *WarmPod
@@ -250,10 +328,6 @@ func (m *Manager) acquirePod(ctx context.Context, req Request) (*WarmPod, error)
 			continue
 		}
 
-		// Score based on:
-		// - Time since last use (prefer LRU)
-		// - Query count (prefer lower)
-		// - Resource fit
 		score := m.scorePod(pod, req)
 		if bestPod == nil || score > bestScore {
 			bestPod = pod
@@ -261,16 +335,41 @@ func (m *Manager) acquirePod(ctx context.Context, req Request) (*WarmPod, error)
 		}
 	}
 
-	if bestPod == nil {
-		metrics.RecordPoolQueueLength(m.pool.Name, m.namespace, len(m.requestQueue))
-		return nil, fmt.Errorf("no idle pods available")
+	if bestPod != nil {
+		bestPod.State = ducklakev1alpha1.PodStateBusy
+		l.Info().
+			Str("pod", bestPod.Name).
+			Float64("score", bestScore).
+			Msg("Found suitable pod")
+		return bestPod, nil
 	}
 
-	// Mark pod as busy
-	bestPod.State = ducklakev1alpha1.PodStateBusy
-	metrics.RecordPodAcquired(m.pool.Name, m.namespace)
+	// No idle pods available, create a new one if possible
+	currentSize := int32(len(m.pods))
+	if currentSize >= m.pool.Spec.MaxSize {
+		l.Error().
+			Int32("currentSize", currentSize).
+			Int32("maxSize", m.pool.Spec.MaxSize).
+			Msg("Cannot create new pod, pool at maximum size")
+		return nil, fmt.Errorf("pool at maximum size")
+	}
 
-	return bestPod, nil
+	l.Debug().Msg("Creating new pod")
+	pod, err := m.createPod(ctx)
+	if err != nil {
+		l.Error().
+			Err(err).
+			Msg("Failed to create new pod")
+		return nil, fmt.Errorf("failed to create pod: %w", err)
+	}
+
+	pod.State = ducklakev1alpha1.PodStateBusy
+	m.pods[pod.Name] = pod
+
+	l.Info().
+		Str("pod", pod.Name).
+		Msg("Created and acquired new pod")
+	return pod, nil
 }
 
 // scorePod scores a pod for a request (higher is better)
@@ -287,47 +386,82 @@ func (m *Manager) scorePod(pod *WarmPod, req Request) float64 {
 	return score
 }
 
-// evaluateScaling evaluates if the pool should scale
+// evaluateScaling evaluates if the pool needs to be scaled
 func (m *Manager) evaluateScaling(ctx context.Context) error {
-	m.mu.RLock()
+	l := logger.FromContext(ctx).With().
+		Str("pool", m.pool.Name).
+		Str("namespace", m.namespace).
+		Logger()
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
 	currentSize := int32(len(m.pods))
-	idleCount := int32(0)
 	busyCount := int32(0)
+	idleCount := int32(0)
 
 	for _, pod := range m.pods {
 		switch pod.State {
-		case ducklakev1alpha1.PodStateIdle:
-			idleCount++
 		case ducklakev1alpha1.PodStateBusy:
 			busyCount++
+		case ducklakev1alpha1.PodStateIdle:
+			idleCount++
 		}
 	}
-	m.mu.RUnlock()
 
-	// Calculate desired size based on utilization
-	targetUtil, _ := strconv.ParseFloat(m.pool.Spec.TargetUtilization, 64)
+	l.Debug().
+		Int32("currentSize", currentSize).
+		Int32("busyPods", busyCount).
+		Int32("idlePods", idleCount).
+		Msg("Current pool state")
 
-	desiredSize := int32(math.Ceil(float64(busyCount) / targetUtil))
-	desiredSize = max(m.pool.Spec.MinSize, min(m.pool.Spec.MaxSize, desiredSize))
+	// Calculate target size based on utilization
+	targetUtilization, _ := strconv.ParseFloat(m.pool.Spec.TargetUtilization, 64)
+	if targetUtilization <= 0 {
+		targetUtilization = 0.8 // Default from CRD
+	}
 
-	// Update metrics
-	metrics.UpdatePoolMetrics(m.pool.Name, m.namespace, currentSize, desiredSize, idleCount, busyCount)
+	desiredSize := int32(math.Ceil(float64(busyCount) / targetUtilization))
+	desiredSize = max(desiredSize, m.pool.Spec.MinSize)
+	desiredSize = min(desiredSize, m.pool.Spec.MaxSize)
 
-	// Scale if needed
+	l.Debug().
+		Float64("targetUtilization", targetUtilization).
+		Int32("desiredSize", desiredSize).
+		Msg("Calculated desired size")
+
+	// Scale up if needed
 	if desiredSize > currentSize {
-		toAdd := min(desiredSize-currentSize, m.pool.Spec.ScalingBehavior.ScaleUpRate)
-		return m.scaleUp(ctx, toAdd)
-	} else if desiredSize < currentSize {
-		// Check stabilization window
-		if m.pool.Status.LastScaleTime != nil {
-			timeSinceLastScale := time.Since(m.pool.Status.LastScaleTime.Time)
-			if timeSinceLastScale < m.pool.Spec.ScalingBehavior.StabilizationWindow.Duration {
-				return nil // Too soon to scale down
+		scaleUpCount := min(desiredSize-currentSize, m.pool.Spec.ScalingBehavior.ScaleUpRate)
+		if scaleUpCount > 0 {
+			l.Info().
+				Int32("scaleUpCount", scaleUpCount).
+				Msg("Scaling up pool")
+			if err := m.scaleUp(ctx, scaleUpCount); err != nil {
+				l.Error().
+					Err(err).
+					Int32("scaleUpCount", scaleUpCount).
+					Msg("Failed to scale up")
+				return fmt.Errorf("failed to scale up: %w", err)
 			}
 		}
+	}
 
-		toRemove := min(currentSize-desiredSize, m.pool.Spec.ScalingBehavior.ScaleDownRate)
-		return m.scaleDown(ctx, toRemove)
+	// Scale down if needed
+	if desiredSize < currentSize {
+		scaleDownCount := min(currentSize-desiredSize, m.pool.Spec.ScalingBehavior.ScaleDownRate)
+		if scaleDownCount > 0 {
+			l.Info().
+				Int32("scaleDownCount", scaleDownCount).
+				Msg("Scaling down pool")
+			if err := m.scaleDown(ctx, scaleDownCount); err != nil {
+				l.Error().
+					Err(err).
+					Int32("scaleDownCount", scaleDownCount).
+					Msg("Failed to scale down")
+				return fmt.Errorf("failed to scale down: %w", err)
+			}
+		}
 	}
 
 	return nil
@@ -335,7 +469,8 @@ func (m *Manager) evaluateScaling(ctx context.Context) error {
 
 // scaleUp adds pods to the pool
 func (m *Manager) scaleUp(ctx context.Context, count int32) error {
-	m.logger.Info().Int32("count", count).Msg("scaling up pool")
+	l := logger.FromContext(ctx)
+	l.Info().Int32("count", count).Msg("scaling up pool")
 
 	metrics.RecordScalingEvent(m.pool.Name, m.namespace, "up")
 
@@ -359,7 +494,8 @@ func (m *Manager) scaleUp(ctx context.Context, count int32) error {
 
 // scaleDown removes pods from the pool
 func (m *Manager) scaleDown(ctx context.Context, count int32) error {
-	m.logger.Info().Int32("count", count).Msg("scaling down pool")
+	l := logger.FromContext(ctx)
+	l.Info().Int32("count", count).Msg("scaling down pool")
 
 	metrics.RecordScalingEvent(m.pool.Name, m.namespace, "down")
 
@@ -375,7 +511,7 @@ func (m *Manager) scaleDown(ctx context.Context, count int32) error {
 
 		// Delete the pod
 		if err := m.deletePod(ctx, pod); err != nil {
-			m.logger.Error().Err(err).Str("pod", podName).Msg("failed to delete pod")
+			l.Error().Err(err).Str("pod", podName).Msg("failed to delete pod")
 			continue
 		}
 
@@ -411,58 +547,90 @@ func (m *Manager) selectPodsForRemoval(count int32) []string {
 
 // enforceLifecyclePolicies enforces pod lifecycle policies
 func (m *Manager) enforceLifecyclePolicies(ctx context.Context) error {
+	l := logger.FromContext(ctx).With().
+		Str("pool", m.pool.Name).
+		Str("namespace", m.namespace).
+		Logger()
+
+	l.Debug().Msg("Enforcing lifecycle policies")
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	now := time.Now()
-	toRemove := []string{}
+	var toRemove []string
 
 	for name, pod := range m.pods {
-		// Skip busy pods
-		if pod.State == ducklakev1alpha1.PodStateBusy {
+		if pod.State != ducklakev1alpha1.PodStateIdle {
 			continue
 		}
 
-		// Check max idle time
-		if m.pool.Spec.LifecyclePolicies.MaxIdleTime.Duration > 0 {
-			idleTime := now.Sub(pod.LastUsed)
-			if idleTime > m.pool.Spec.LifecyclePolicies.MaxIdleTime.Duration {
-				toRemove = append(toRemove, name)
-				continue
-			}
+		// Check idle time
+		if m.pool.Spec.LifecyclePolicies.MaxIdleTime.Duration > 0 &&
+			now.Sub(pod.LastUsed) > m.pool.Spec.LifecyclePolicies.MaxIdleTime.Duration {
+			l.Debug().
+				Str("pod", name).
+				Time("lastUsed", pod.LastUsed).
+				Dur("idleTime", now.Sub(pod.LastUsed)).
+				Msg("Pod exceeded max idle time")
+			toRemove = append(toRemove, name)
+			continue
 		}
 
-		// Check max lifetime
-		if m.pool.Spec.LifecyclePolicies.MaxLifetime.Duration > 0 {
-			lifetime := now.Sub(pod.CreatedAt)
-			if lifetime > m.pool.Spec.LifecyclePolicies.MaxLifetime.Duration {
-				toRemove = append(toRemove, name)
-				continue
-			}
+		// Check lifetime
+		if m.pool.Spec.LifecyclePolicies.MaxLifetime.Duration > 0 &&
+			now.Sub(pod.CreatedAt) > m.pool.Spec.LifecyclePolicies.MaxLifetime.Duration {
+			l.Debug().
+				Str("pod", name).
+				Time("createdAt", pod.CreatedAt).
+				Dur("lifetime", now.Sub(pod.CreatedAt)).
+				Msg("Pod exceeded max lifetime")
+			toRemove = append(toRemove, name)
+			continue
 		}
 
-		// Check max queries
-		if m.pool.Spec.LifecyclePolicies.MaxQueries > 0 {
-			if pod.QueryCount >= m.pool.Spec.LifecyclePolicies.MaxQueries {
-				toRemove = append(toRemove, name)
-				continue
-			}
+		// Check query count
+		if m.pool.Spec.LifecyclePolicies.MaxQueries > 0 &&
+			pod.QueryCount >= m.pool.Spec.LifecyclePolicies.MaxQueries {
+			l.Debug().
+				Str("pod", name).
+				Int32("queryCount", pod.QueryCount).
+				Int32("maxQueries", m.pool.Spec.LifecyclePolicies.MaxQueries).
+				Msg("Pod exceeded max queries")
+			toRemove = append(toRemove, name)
+			continue
 		}
 	}
 
 	// Remove pods that violate policies
 	for _, name := range toRemove {
-		m.logger.Info().Str("pod", name).Msg("removing pod due to lifecycle policy")
 		pod := m.pods[name]
+		l.Info().
+			Str("pod", name).
+			Time("createdAt", pod.CreatedAt).
+			Time("lastUsed", pod.LastUsed).
+			Int32("queryCount", pod.QueryCount).
+			Msg("Removing pod due to lifecycle policy")
+
 		if err := m.deletePod(ctx, pod); err != nil {
-			m.logger.Error().Err(err).Str("pod", name).Msg("failed to delete pod")
+			l.Error().
+				Err(err).
+				Str("pod", name).
+				Msg("Failed to delete pod")
 			continue
 		}
 		delete(m.pods, name)
 	}
 
-	// Ensure minimum pods
-	return m.ensureMinimumPods(ctx)
+	if len(toRemove) > 0 {
+		l.Info().
+			Int("removedCount", len(toRemove)).
+			Msg("Completed lifecycle policy enforcement")
+	} else {
+		l.Debug().Msg("No pods need to be removed")
+	}
+
+	return nil
 }
 
 // ensureMinimumPods ensures the pool has the minimum number of pods
@@ -519,7 +687,10 @@ func (m *Manager) createPod(ctx context.Context) (*WarmPod, error) {
 		config:     m.config,
 	}
 
-	m.logger.Info().Str("pod", podName).Msg("created warm pod")
+	l := logger.FromContext(ctx).With().
+		Str("pod", podName).
+		Logger()
+	l.Info().Msg("created warm pod")
 	return warmPod, nil
 }
 
@@ -688,7 +859,12 @@ func (m *Manager) GetPoolStatus() ducklakev1alpha1.DuckLakePoolStatus {
 
 // Shutdown gracefully shuts down the pool manager
 func (m *Manager) Shutdown(ctx context.Context) error {
-	m.logger.Info().Msg("shutting down pool manager")
+	l := logger.FromContext(ctx).With().
+		Str("pool", m.pool.Name).
+		Str("namespace", m.namespace).
+		Logger()
+
+	l.Info().Msg("shutting down pool manager")
 
 	// Stop accepting new requests
 	close(m.requestQueue)
@@ -706,7 +882,7 @@ func (m *Manager) Shutdown(ctx context.Context) error {
 
 	for _, pod := range m.pods {
 		if err := m.deletePod(ctx, pod); err != nil {
-			m.logger.Error().Err(err).Str("pod", pod.Name).Msg("failed to delete pod during shutdown")
+			l.Error().Err(err).Str("pod", pod.Name).Msg("failed to delete pod during shutdown")
 		}
 	}
 

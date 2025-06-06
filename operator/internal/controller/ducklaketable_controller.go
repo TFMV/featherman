@@ -67,13 +67,13 @@ type PoolManager interface {
 
 // Reconcile handles DuckLakeTable resources
 func (r *DuckLakeTableReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	l := logger.WithValues(r.Logger,
-		"controller", "DuckLakeTable",
-		"namespace", req.Namespace,
-		"name", req.Name)
+	log := logger.FromContext(ctx).With().
+		Str("controller", "DuckLakeTable").
+		Str("namespace", req.Namespace).
+		Str("name", req.Name).
+		Logger()
+	l := &log
 	ctx = logger.WithContext(ctx, l)
-
-	l.Info().Msg("reconciling DuckLakeTable")
 
 	startTime := time.Now()
 	defer func() {
@@ -84,19 +84,25 @@ func (r *DuckLakeTableReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	table := &ducklakev1alpha1.DuckLakeTable{}
 	if err := r.Get(ctx, req.NamespacedName, table); err != nil {
 		if errors.IsNotFound(err) {
+			l.Debug().Msg("DuckLakeTable not found, ignoring")
 			return ctrl.Result{}, nil
 		}
-		l.Error().Err(err).Msg("failed to get DuckLakeTable")
+		l.Error().Err(err).Msg("Failed to get DuckLakeTable")
 		metrics.RecordTableOperation("get", "failed")
 		return ctrl.Result{}, fmt.Errorf("failed to get DuckLakeTable: %w", err)
 	}
+
+	l.Info().
+		Str("phase", string(table.Status.Phase)).
+		Bool("deletion", !table.DeletionTimestamp.IsZero()).
+		Msg("Starting reconciliation")
 
 	// List all jobs for this table
 	var jobs batchv1.JobList
 	if err := r.List(ctx, &jobs, client.InNamespace(table.Namespace), client.MatchingLabels{
 		"ducklake.featherman.dev/table": table.Name,
 	}); err != nil {
-		l.Error().Err(err).Msg("failed to list jobs")
+		l.Error().Err(err).Msg("Failed to list jobs")
 		return ctrl.Result{}, fmt.Errorf("failed to list jobs: %w", err)
 	}
 
@@ -111,32 +117,45 @@ func (r *DuckLakeTableReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 
 	// If we have a job, update the status based on its state
 	if latestJob != nil {
+		l.Debug().
+			Str("jobName", latestJob.Name).
+			Time("creationTime", latestJob.CreationTimestamp.Time).
+			Msg("Processing latest job")
+
 		state, err := r.Lifecycle.GetJobState(ctx, latestJob)
 		if err != nil {
-			l.Error().Err(err).Msg("failed to get job state")
+			l.Error().Err(err).Msg("Failed to get job state")
 			return ctrl.Result{}, fmt.Errorf("failed to get job state: %w", err)
 		}
 
 		if state.Phase == duckdb.JobPhaseComplete {
+			l.Info().
+				Str("jobName", latestJob.Name).
+				Time("completionTime", state.CompletionTime.Time).
+				Msg("Job completed successfully")
+
 			// Verify Parquet file consistency with retries
+			l.Debug().Msg("Verifying Parquet file consistency")
 			verifyOp := func(ctx context.Context) error {
 				return r.Consistency.VerifyParquetConsistency(ctx, table)
 			}
 
 			if err := retry.Do(ctx, verifyOp, r.RetryConfig); err != nil {
-				l.Error().Err(err).Msg("failed to verify Parquet consistency")
+				l.Error().Err(err).Msg("Failed to verify Parquet consistency")
 				table.Status.Phase = ducklakev1alpha1.TablePhaseFailed
 				metrics.RecordTableOperation("verify_consistency", "failed")
 				r.Recorder.Event(table, corev1.EventTypeWarning, "ConsistencyCheckFailed", err.Error())
 				if err := r.Status().Update(ctx, table); err != nil {
-					l.Error().Err(err).Msg("failed to update status")
+					l.Error().Err(err).Msg("Failed to update status")
 					return ctrl.Result{}, fmt.Errorf("failed to update status: %w", err)
 				}
 				return ctrl.Result{}, fmt.Errorf("failed to verify Parquet consistency: %w", err)
 			}
 			metrics.RecordTableOperation("verify_consistency", "succeeded")
+			l.Info().Msg("Parquet file consistency verified")
 
 			// List Parquet files to update status
+			l.Debug().Msg("Listing Parquet files")
 			listOp := func(ctx context.Context) error {
 				objects, err := r.Consistency.ListParquetFiles(ctx, table)
 				if err != nil {
@@ -158,7 +177,7 @@ func (r *DuckLakeTableReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 			}
 
 			if err := retry.Do(ctx, listOp, r.RetryConfig); err != nil {
-				l.Error().Err(err).Msg("failed to list Parquet files")
+				l.Error().Err(err).Msg("Failed to list Parquet files")
 				r.Recorder.Event(table, corev1.EventTypeWarning, "ListParquetFilesFailed", err.Error())
 				return ctrl.Result{}, fmt.Errorf("failed to list Parquet files: %w", err)
 			}
@@ -172,7 +191,7 @@ func (r *DuckLakeTableReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 
 			// Update status
 			if err := r.Status().Update(ctx, table); err != nil {
-				l.Error().Err(err).Msg("failed to update status")
+				l.Error().Err(err).Msg("Failed to update status")
 				r.Recorder.Event(table, corev1.EventTypeWarning, "StatusUpdateFailed", err.Error())
 				return ctrl.Result{}, fmt.Errorf("failed to update status: %w", err)
 			}
@@ -180,35 +199,40 @@ func (r *DuckLakeTableReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 			// Get job logs for debugging
 			logs, err := r.Lifecycle.GetJobLogs(ctx, latestJob)
 			if err != nil {
-				l.Warn().Err(err).Msg("failed to get job logs")
+				l.Warn().Err(err).Msg("Failed to get job logs")
 			} else {
 				for podName, log := range logs {
 					l.Debug().
 						Str("pod", podName).
 						Str("logs", log).
-						Msg("job pod logs")
+						Msg("Job pod logs")
 				}
 			}
 
 			l.Info().
 				Int64("bytesWritten", table.Status.BytesWritten).
 				Time("lastModified", table.Status.LastModified.Time).
-				Msg("table reconciliation completed successfully")
+				Msg("Table reconciliation completed successfully")
 
 			return ctrl.Result{}, nil
 		} else if state.Phase == duckdb.JobPhaseFailed {
+			l.Warn().
+				Str("jobName", latestJob.Name).
+				Str("message", state.Message).
+				Msg("Job failed")
+
 			table.Status.Phase = ducklakev1alpha1.TablePhaseFailed
 
 			// Get job logs for debugging
 			logs, err := r.Lifecycle.GetJobLogs(ctx, latestJob)
 			if err != nil {
-				l.Warn().Err(err).Msg("failed to get job logs")
+				l.Warn().Err(err).Msg("Failed to get job logs")
 			} else {
 				for podName, log := range logs {
 					l.Error().
 						Str("pod", podName).
 						Str("logs", log).
-						Msg("job failed, pod logs")
+						Msg("Job failed, pod logs")
 				}
 			}
 
@@ -221,15 +245,10 @@ func (r *DuckLakeTableReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 
 			// Update status
 			if err := r.Status().Update(ctx, table); err != nil {
-				l.Error().Err(err).Msg("failed to update status")
+				l.Error().Err(err).Msg("Failed to update status")
 				r.Recorder.Event(table, corev1.EventTypeWarning, "StatusUpdateFailed", err.Error())
 				return ctrl.Result{}, fmt.Errorf("failed to update status: %w", err)
 			}
-
-			l.Warn().
-				Str("jobName", latestJob.Name).
-				Str("message", state.Message).
-				Msg("job failed")
 
 			return ctrl.Result{}, fmt.Errorf("job failed: %s", state.Message)
 		}
@@ -237,9 +256,10 @@ func (r *DuckLakeTableReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 
 	// Initialize status if needed
 	if table.Status.Phase == "" {
+		l.Debug().Msg("Initializing table status")
 		table.Status.Phase = ducklakev1alpha1.TablePhasePending
 		if err := r.Status().Update(ctx, table); err != nil {
-			l.Error().Err(err).Msg("failed to update status")
+			l.Error().Err(err).Msg("Failed to update status")
 			metrics.RecordTableOperation("status_update", "failed")
 			return ctrl.Result{}, fmt.Errorf("failed to update status: %w", err)
 		}
@@ -248,13 +268,12 @@ func (r *DuckLakeTableReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 
 	// Add finalizer
 	if !controllerutil.ContainsFinalizer(table, "ducklaketable.featherman.dev") {
+		l.Debug().Msg("Adding finalizer")
 		controllerutil.AddFinalizer(table, "ducklaketable.featherman.dev")
 		if err := r.Update(ctx, table); err != nil {
-			l.Error().Err(err).Msg("failed to add finalizer")
-			metrics.RecordTableOperation("add_finalizer", "failed")
+			l.Error().Err(err).Msg("Failed to add finalizer")
 			return ctrl.Result{}, fmt.Errorf("failed to add finalizer: %w", err)
 		}
-		metrics.RecordTableOperation("add_finalizer", "succeeded")
 	}
 
 	// Handle deletion
@@ -458,69 +477,53 @@ func (r *DuckLakeTableReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 
 // handleDeletion handles the deletion of a DuckLakeTable
 func (r *DuckLakeTableReconciler) handleDeletion(ctx context.Context, table *ducklakev1alpha1.DuckLakeTable) (ctrl.Result, error) {
-	l := logger.WithValues(r.Logger,
-		"controller", "DuckLakeTable",
-		"namespace", table.Namespace,
-		"name", table.Name)
-	ctx = logger.WithContext(ctx, l)
+	l := logger.FromContext(ctx)
 
-	l.Info().Msg("handling table deletion")
+	l.Info().
+		Str("table", table.Name).
+		Str("namespace", table.Namespace).
+		Msg("Starting DuckLakeTable deletion process")
 
-	// Generate SQL for dropping table
-	dropSQL := fmt.Sprintf("DROP TABLE IF EXISTS %s;", table.Spec.Name)
+	// Delete any associated jobs
+	var jobs batchv1.JobList
+	if err := r.List(ctx, &jobs, client.InNamespace(table.Namespace), client.MatchingLabels{
+		"ducklake.featherman.dev/table": table.Name,
+	}); err != nil {
+		l.Error().
+			Err(err).
+			Msg("Failed to list jobs during deletion")
+		return ctrl.Result{}, fmt.Errorf("failed to list jobs: %w", err)
+	}
 
-	// Get the catalog
-	catalog := &ducklakev1alpha1.DuckLakeCatalog{}
-	if err := r.Get(ctx, client.ObjectKey{
-		Namespace: table.Namespace,
-		Name:      table.Spec.CatalogRef,
-	}, catalog); err != nil {
-		if errors.IsNotFound(err) {
-			// If catalog is not found, just remove the finalizer and return
-			l.Info().Msg("catalog not found, skipping cleanup")
-			controllerutil.RemoveFinalizer(table, "ducklaketable.featherman.dev")
-			if err := r.Update(ctx, table); err != nil {
-				l.Error().Err(err).Msg("failed to remove finalizer")
-				return ctrl.Result{}, fmt.Errorf("failed to remove finalizer: %w", err)
-			}
-			return ctrl.Result{}, nil
+	// Delete each job
+	for i := range jobs.Items {
+		job := &jobs.Items[i]
+		l.Debug().
+			Str("job", job.Name).
+			Msg("Deleting associated job")
+		if err := r.Delete(ctx, job); err != nil && !errors.IsNotFound(err) {
+			l.Error().
+				Err(err).
+				Str("job", job.Name).
+				Msg("Failed to delete job")
+			return ctrl.Result{}, fmt.Errorf("failed to delete job %s: %w", job.Name, err)
 		}
-		l.Error().Err(err).Msg("failed to get catalog")
-		r.Recorder.Event(table, corev1.EventTypeWarning, "CatalogNotFound", err.Error())
-		return ctrl.Result{}, fmt.Errorf("failed to get catalog: %w", err)
-	}
-
-	// Create DuckDB job for cleanup
-	op := &duckdb.Operation{
-		Type:          duckdb.OperationTypeWrite,
-		SQL:           dropSQL,
-		Table:         table,
-		Catalog:       catalog,
-		PodTemplate:   r.PodTemplate,
-		JobNameSuffix: "drop",
-	}
-
-	// Create the job
-	job, err := r.JobManager.CreateJob(op)
-	if err != nil {
-		l.Error().Err(err).Msg("failed to create cleanup job")
-		r.Recorder.Event(table, corev1.EventTypeWarning, "CleanupFailed", err.Error())
-		return ctrl.Result{}, fmt.Errorf("failed to create cleanup job: %w", err)
-	}
-
-	// Wait for job completion
-	if !duckdb.IsJobComplete(job) && !duckdb.IsJobFailed(job) {
-		return ctrl.Result{Requeue: true}, nil
 	}
 
 	// Remove finalizer
-	controllerutil.RemoveFinalizer(table, "ducklaketable.featherman.dev")
-	if err := r.Update(ctx, table); err != nil {
-		l.Error().Err(err).Msg("failed to remove finalizer")
-		return ctrl.Result{}, fmt.Errorf("failed to remove finalizer: %w", err)
+	if controllerutil.ContainsFinalizer(table, "ducklaketable.featherman.dev") {
+		l.Debug().Msg("Removing finalizer")
+		controllerutil.RemoveFinalizer(table, "ducklaketable.featherman.dev")
+		if err := r.Update(ctx, table); err != nil {
+			l.Error().
+				Err(err).
+				Msg("Failed to remove finalizer")
+			return ctrl.Result{}, fmt.Errorf("failed to remove finalizer: %w", err)
+		}
+		l.Info().Msg("Successfully removed finalizer")
 	}
 
-	l.Info().Msg("handled table deletion successfully")
+	l.Info().Msg("Successfully completed DuckLakeTable deletion")
 	return ctrl.Result{}, nil
 }
 

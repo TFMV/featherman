@@ -125,7 +125,7 @@ func (r *DuckLakePoolReconciler) Reconcile(ctx context.Context, req ctrl.Request
 
 	if !exists {
 		// Create new pool manager
-		mgr = pool.NewManager(r.Client, r.K8sClient, r.Scheme, l, duckLakePool, duckLakePool.Namespace, r.Config)
+		mgr = pool.NewManager(r.Client, r.K8sClient, r.Scheme, duckLakePool, duckLakePool.Namespace, r.Config)
 		r.poolManagers[managerKey] = mgr
 
 		// Start the manager in a goroutine
