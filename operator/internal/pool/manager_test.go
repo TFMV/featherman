@@ -105,6 +105,7 @@ var _ = Describe("Pool Manager", func() {
 				duckPool,
 				"default",
 				&rest.Config{},
+				nil,
 			)
 
 			// Request a pod (should fail as no pods are available)
@@ -148,6 +149,7 @@ var _ = Describe("Pool Manager", func() {
 				duckPool,
 				"default",
 				&rest.Config{},
+				nil,
 			)
 
 			status := manager.GetPoolStatus()
@@ -168,6 +170,7 @@ var _ = Describe("Pool Manager", func() {
 				duckPool,
 				"default",
 				&rest.Config{},
+				nil,
 			)
 
 			err := manager.Shutdown(ctx)
