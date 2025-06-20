@@ -105,4 +105,3 @@ func mustJSON(in interface{}) json.RawMessage {
     return json.RawMessage(b)
 }
 
-*** End of File
