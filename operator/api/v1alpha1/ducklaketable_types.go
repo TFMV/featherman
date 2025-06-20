@@ -229,7 +229,15 @@ type DuckLakeTableSpec struct {
 
 	// MaterializeTo configures optional view materialization
 	// +optional
-	MaterializeTo *MaterializeToSpec `json:"materializeTo,omitempty"`
+       MaterializeTo *MaterializeToSpec `json:"materializeTo,omitempty"`
+
+       // RestoreVersion, if set, restores the table to a historical version
+       // +optional
+       RestoreVersion string `json:"restoreVersion,omitempty"`
+
+       // Versioning controls automatic metadata snapshotting
+       // +optional
+       Versioning *VersioningSpec `json:"versioning,omitempty"`
 }
 
 // DuckLakeTableStatus defines the observed state of DuckLakeTable
@@ -260,7 +268,11 @@ type DuckLakeTableStatus struct {
 
 	// Materialization holds information about the last materialization run
 	// +optional
-	Materialization *MaterializationStatus `json:"materialization,omitempty"`
+       Materialization *MaterializationStatus `json:"materialization,omitempty"`
+
+       // VersionHistory lists recent table versions
+       // +optional
+       VersionHistory []VersionEntry `json:"versionHistory,omitempty"`
 }
 
 // +kubebuilder:object:root=true
