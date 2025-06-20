@@ -43,6 +43,17 @@ func (r *DuckLakeTable) Default() {
 		r.Spec.Mode = TableModeAppend
 	}
 
+	if r.Spec.MaterializeTo != nil && r.Spec.MaterializeTo.Enabled {
+		if r.Spec.MaterializeTo.Format.Type == "" {
+			l.Debug().Msg("Setting materialization format type to parquet")
+			r.Spec.MaterializeTo.Format.Type = "parquet"
+		}
+		if r.Spec.MaterializeTo.Format.Compression == "" {
+			l.Debug().Msg("Setting materialization compression to ZSTD")
+			r.Spec.MaterializeTo.Format.Compression = CompressionZSTD
+		}
+	}
+
 	l.Info().
 		Str("compression", string(r.Spec.Format.Compression)).
 		Str("mode", string(r.Spec.Mode)).
@@ -91,6 +102,24 @@ func (r *DuckLakeTable) ValidateCreate() (admission.Warnings, error) {
 			if col.Name == partition {
 				found = true
 				break
+			}
+		}
+
+		if r.Spec.MaterializeTo != nil && r.Spec.MaterializeTo.Enabled {
+			if r.Spec.MaterializeTo.SQL == "" {
+				l.Error().Msg("Materialization SQL must be provided")
+				allErrs = append(allErrs, field.Required(
+					field.NewPath("spec").Child("materializeTo").Child("sql"),
+					"SQL query is required when materialization is enabled",
+				))
+			}
+
+			if r.Spec.MaterializeTo.Destination.Bucket == "" {
+				l.Error().Msg("Materialization destination bucket must be provided")
+				allErrs = append(allErrs, field.Required(
+					field.NewPath("spec").Child("materializeTo").Child("destination").Child("bucket"),
+					"bucket is required",
+				))
 			}
 		}
 		if !found {
@@ -158,6 +187,24 @@ func (r *DuckLakeTable) ValidateUpdate(old runtime.Object) (admission.Warnings, 
 					"column type is immutable",
 				))
 			}
+		}
+	}
+
+	if r.Spec.MaterializeTo != nil && r.Spec.MaterializeTo.Enabled {
+		if r.Spec.MaterializeTo.SQL == "" {
+			l.Error().Msg("Materialization SQL must be provided")
+			allErrs = append(allErrs, field.Required(
+				field.NewPath("spec").Child("materializeTo").Child("sql"),
+				"SQL query is required when materialization is enabled",
+			))
+		}
+
+		if r.Spec.MaterializeTo.Destination.Bucket == "" {
+			l.Error().Msg("Materialization destination bucket must be provided")
+			allErrs = append(allErrs, field.Required(
+				field.NewPath("spec").Child("materializeTo").Child("destination").Child("bucket"),
+				"bucket is required",
+			))
 		}
 	}
 

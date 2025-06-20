@@ -198,6 +198,27 @@ spec:
 4. **Graceful Degradation**: Falls back to Jobs if pool unavailable
 5. **Cost Optimization**: Scales based on actual demand
 
+## View Materialization
+
+Featherman can materialize query results back to object storage. Define the
+`materializeTo` block on a `DuckLakeTable` to export a view as Parquet.
+
+```yaml
+spec:
+  materializeTo:
+    enabled: true
+    sql: "SELECT country, COUNT(*) AS cnt FROM users GROUP BY country"
+    destination:
+      bucket: my-exports
+      prefix: top_users/
+    format:
+      type: parquet
+      compression: ZSTD
+```
+
+When enabled, the operator will run the query and write results to the
+specified bucket and prefix.
+
 ### Metrics
 
 The pool manager exposes Prometheus metrics for:
