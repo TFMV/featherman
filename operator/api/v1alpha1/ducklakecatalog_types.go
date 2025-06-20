@@ -77,8 +77,9 @@ type BackupPolicySpec struct {
 	// RetentionDays is the number of days to retain backups
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:default=7
-	RetentionDays int `json:"retentionDays,omitempty"`
+        RetentionDays int `json:"retentionDays,omitempty"`
 }
+
 
 // DuckLakeCatalogSpec defines the desired state of DuckLakeCatalog
 type DuckLakeCatalogSpec struct {
@@ -103,9 +104,17 @@ type DuckLakeCatalogSpec struct {
 	// +optional
 	BackupPolicy *BackupPolicySpec `json:"backupPolicy,omitempty"`
 
-	// CatalogPath is the path to the DuckDB catalog file within the PVC
-	// +kubebuilder:default=/catalog/catalog.db
-	CatalogPath string `json:"catalogPath,omitempty"`
+        // CatalogPath is the path to the DuckDB catalog file within the PVC
+        // +kubebuilder:default=/catalog/catalog.db
+        CatalogPath string `json:"catalogPath,omitempty"`
+
+       // RestoreVersion, if set, restores the catalog to a historical version
+       // +optional
+       RestoreVersion string `json:"restoreVersion,omitempty"`
+
+       // Versioning controls automatic metadata snapshotting
+       // +optional
+       Versioning *VersioningSpec `json:"versioning,omitempty"`
 }
 
 // CatalogPhase represents the current phase of the catalog
@@ -139,7 +148,11 @@ type DuckLakeCatalogStatus struct {
 
 	// ObservedGeneration is the last generation that was acted on
 	// +optional
-	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
+       ObservedGeneration int64 `json:"observedGeneration,omitempty"`
+
+       // VersionHistory lists recent catalog versions
+       // +optional
+       VersionHistory []VersionEntry `json:"versionHistory,omitempty"`
 }
 
 // +kubebuilder:object:root=true
