@@ -191,3 +191,45 @@ func (g *Generator) GenerateQuerySQL(table *ducklakev1alpha1.DuckLakeTable, quer
 
 	return sb.String(), nil
 }
+
+// GenerateMaterializationSQL generates SQL for view materialization
+func (g *Generator) GenerateMaterializationSQL(table *ducklakev1alpha1.DuckLakeTable) (string, error) {
+	if table.Spec.MaterializeTo == nil || !table.Spec.MaterializeTo.Enabled {
+		return "", fmt.Errorf("materialization not enabled")
+	}
+
+	m := table.Spec.MaterializeTo
+
+	dest := fmt.Sprintf("s3://%s/%s", m.Destination.Bucket, m.Destination.Prefix)
+
+	var sb strings.Builder
+	sb.WriteString("COPY (")
+	sb.WriteString(m.SQL)
+	sb.WriteString(") TO '")
+	sb.WriteString(dest)
+	sb.WriteString("' (")
+	sb.WriteString("FORMAT '")
+	sb.WriteString(strings.ToLower(m.Format.Type))
+	sb.WriteString("'")
+
+	if m.Format.Compression != "" {
+		sb.WriteString(", COMPRESSION '")
+		sb.WriteString(string(m.Format.Compression))
+		sb.WriteString("'")
+	}
+
+	if len(m.Format.PartitionBy) > 0 {
+		sb.WriteString(", PARTITION_BY (")
+		for i, col := range m.Format.PartitionBy {
+			if i > 0 {
+				sb.WriteString(", ")
+			}
+			sb.WriteString(col)
+		}
+		sb.WriteString(")")
+	}
+
+	sb.WriteString(");")
+
+	return sb.String(), nil
+}

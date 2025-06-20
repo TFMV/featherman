@@ -32,23 +32,25 @@ import (
 	"github.com/TFMV/featherman/operator/internal/retry"
 	"github.com/TFMV/featherman/operator/internal/sql"
 	"github.com/TFMV/featherman/operator/internal/storage"
+	"github.com/TFMV/featherman/operator/pkg/materializer"
 )
 
 // DuckLakeTableReconciler reconciles a DuckLakeTable object
 type DuckLakeTableReconciler struct {
 	client.Client
-	Scheme      *runtime.Scheme
-	Recorder    record.EventRecorder
-	Logger      *zerolog.Logger
-	JobManager  *duckdb.JobManager
-	SQLGen      *sql.Generator
-	PodTemplate *config.PodTemplateConfig
-	Consistency *storage.ConsistencyChecker
-	RetryConfig retry.RetryConfig
-	Lifecycle   *duckdb.LifecycleManager
-	PoolManager PoolManager
-	Config      *rest.Config
-	K8sClient   kubernetes.Interface
+	Scheme       *runtime.Scheme
+	Recorder     record.EventRecorder
+	Logger       *zerolog.Logger
+	JobManager   *duckdb.JobManager
+	SQLGen       *sql.Generator
+	Materializer *materializer.Runner
+	PodTemplate  *config.PodTemplateConfig
+	Consistency  *storage.ConsistencyChecker
+	RetryConfig  retry.RetryConfig
+	Lifecycle    *duckdb.LifecycleManager
+	PoolManager  PoolManager
+	Config       *rest.Config
+	K8sClient    kubernetes.Interface
 }
 
 // PoolManager provides access to warm pod pools
@@ -129,90 +131,153 @@ func (r *DuckLakeTableReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		}
 
 		if state.Phase == duckdb.JobPhaseComplete {
+			opType := latestJob.Labels["app.kubernetes.io/operation"]
 			l.Info().
 				Str("jobName", latestJob.Name).
 				Time("completionTime", state.CompletionTime.Time).
 				Msg("Job completed successfully")
 
-			// Verify Parquet file consistency with retries
-			l.Debug().Msg("Verifying Parquet file consistency")
-			verifyOp := func(ctx context.Context) error {
-				return r.Consistency.VerifyParquetConsistency(ctx, table)
-			}
+			if opType == string(duckdb.OperationTypeWrite) {
+				// Verify Parquet file consistency with retries
+				l.Debug().Msg("Verifying Parquet file consistency")
+				verifyOp := func(ctx context.Context) error {
+					return r.Consistency.VerifyParquetConsistency(ctx, table)
+				}
 
-			if err := retry.Do(ctx, verifyOp, r.RetryConfig); err != nil {
-				l.Error().Err(err).Msg("Failed to verify Parquet consistency")
-				table.Status.Phase = ducklakev1alpha1.TablePhaseFailed
-				metrics.RecordTableOperation("verify_consistency", "failed")
-				r.Recorder.Event(table, corev1.EventTypeWarning, "ConsistencyCheckFailed", err.Error())
+				if err := retry.Do(ctx, verifyOp, r.RetryConfig); err != nil {
+					l.Error().Err(err).Msg("Failed to verify Parquet consistency")
+					table.Status.Phase = ducklakev1alpha1.TablePhaseFailed
+					metrics.RecordTableOperation("verify_consistency", "failed")
+					r.Recorder.Event(table, corev1.EventTypeWarning, "ConsistencyCheckFailed", err.Error())
+					if err := r.Status().Update(ctx, table); err != nil {
+						l.Error().Err(err).Msg("Failed to update status")
+						return ctrl.Result{}, fmt.Errorf("failed to update status: %w", err)
+					}
+					return ctrl.Result{}, fmt.Errorf("failed to verify Parquet consistency: %w", err)
+				}
+				metrics.RecordTableOperation("verify_consistency", "succeeded")
+				l.Info().Msg("Parquet file consistency verified")
+
+				// List Parquet files to update status
+				l.Debug().Msg("Listing Parquet files")
+				listOp := func(ctx context.Context) error {
+					objects, err := r.Consistency.ListParquetFiles(ctx, table)
+					if err != nil {
+						return err
+					}
+
+					var totalBytes int64
+					for _, obj := range objects {
+						totalBytes += *obj.Size
+					}
+
+					table.Status.Phase = ducklakev1alpha1.TablePhaseSucceeded
+					table.Status.LastModified = &metav1.Time{Time: state.CompletionTime.Time}
+					table.Status.BytesWritten = totalBytes
+
+					return nil
+				}
+
+				if err := retry.Do(ctx, listOp, r.RetryConfig); err != nil {
+					l.Error().Err(err).Msg("Failed to list Parquet files")
+					r.Recorder.Event(table, corev1.EventTypeWarning, "ListParquetFilesFailed", err.Error())
+					return ctrl.Result{}, fmt.Errorf("failed to list Parquet files: %w", err)
+				}
+
+				metrics.RecordTableOperation("write", "succeeded")
+
 				if err := r.Status().Update(ctx, table); err != nil {
 					l.Error().Err(err).Msg("Failed to update status")
+					r.Recorder.Event(table, corev1.EventTypeWarning, "StatusUpdateFailed", err.Error())
 					return ctrl.Result{}, fmt.Errorf("failed to update status: %w", err)
 				}
-				return ctrl.Result{}, fmt.Errorf("failed to verify Parquet consistency: %w", err)
-			}
-			metrics.RecordTableOperation("verify_consistency", "succeeded")
-			l.Info().Msg("Parquet file consistency verified")
 
-			// List Parquet files to update status
-			l.Debug().Msg("Listing Parquet files")
-			listOp := func(ctx context.Context) error {
-				objects, err := r.Consistency.ListParquetFiles(ctx, table)
+				if table.Spec.MaterializeTo != nil && table.Spec.MaterializeTo.Enabled {
+					matSQL, err := r.SQLGen.GenerateMaterializationSQL(table)
+					if err != nil {
+						l.Error().Err(err).Msg("failed to generate materialization SQL")
+						return ctrl.Result{}, fmt.Errorf("failed to generate materialization SQL: %w", err)
+					}
+
+					catalog := &ducklakev1alpha1.DuckLakeCatalog{}
+					if err := r.Get(ctx, client.ObjectKey{Namespace: table.Namespace, Name: table.Spec.CatalogRef}, catalog); err != nil {
+						l.Error().Err(err).Msg("failed to get catalog for materialization")
+						return ctrl.Result{}, fmt.Errorf("failed to get catalog: %w", err)
+					}
+
+					op := &duckdb.Operation{
+						Type:          duckdb.OperationTypeRead,
+						SQL:           matSQL,
+						Table:         table,
+						Catalog:       catalog,
+						PodTemplate:   r.PodTemplate,
+						JobNameSuffix: "materialize",
+					}
+
+					var mJob *batchv1.Job
+					createOp := func(ctx context.Context) error {
+						var err error
+						mJob, err = r.JobManager.CreateJob(op)
+						return err
+					}
+
+					if err := retry.Do(ctx, createOp, r.RetryConfig); err != nil {
+						l.Error().Err(err).Msg("failed to create materialization job")
+						return ctrl.Result{}, fmt.Errorf("failed to create materialization job: %w", err)
+					}
+
+					if err := ctrl.SetControllerReference(table, mJob, r.Scheme); err != nil {
+						l.Error().Err(err).Msg("failed to set controller reference on materialization job")
+						return ctrl.Result{}, fmt.Errorf("failed to set controller reference: %w", err)
+					}
+
+					if err := r.Create(ctx, mJob); err != nil {
+						l.Error().Err(err).Msg("failed to create materialization job")
+						return ctrl.Result{}, fmt.Errorf("failed to create materialization job: %w", err)
+					}
+
+					l.Info().Str("jobName", mJob.Name).Msg("materialization job created")
+				}
+
+				logs, err := r.Lifecycle.GetJobLogs(ctx, latestJob)
 				if err != nil {
-					return err
+					l.Warn().Err(err).Msg("Failed to get job logs")
+				} else {
+					for podName, log := range logs {
+						l.Debug().Str("pod", podName).Str("logs", log).Msg("Job pod logs")
+					}
 				}
 
-				// Calculate total bytes written
-				var totalBytes int64
-				for _, obj := range objects {
-					totalBytes += *obj.Size
+				l.Info().Int64("bytesWritten", table.Status.BytesWritten).Time("lastModified", table.Status.LastModified.Time).Msg("Table reconciliation completed successfully")
+
+				return ctrl.Result{}, nil
+			}
+
+			// Materialization job completed
+			if table.Spec.MaterializeTo != nil && table.Spec.MaterializeTo.Enabled {
+				table.Status.Materialization = &ducklakev1alpha1.MaterializationStatus{
+					LastRun:    &metav1.Time{Time: state.CompletionTime.Time},
+					Duration:   metav1.Duration{Duration: state.CompletionTime.Sub(state.StartTime.Time)},
+					OutputPath: fmt.Sprintf("s3://%s/%s", table.Spec.MaterializeTo.Destination.Bucket, table.Spec.MaterializeTo.Destination.Prefix),
 				}
-
-				// Update status
-				table.Status.Phase = ducklakev1alpha1.TablePhaseSucceeded
-				table.Status.LastModified = &metav1.Time{Time: state.CompletionTime.Time}
-				table.Status.BytesWritten = totalBytes
-
-				return nil
+				if err := r.Status().Update(ctx, table); err != nil {
+					l.Error().Err(err).Msg("Failed to update materialization status")
+					return ctrl.Result{}, fmt.Errorf("failed to update status: %w", err)
+				}
 			}
 
-			if err := retry.Do(ctx, listOp, r.RetryConfig); err != nil {
-				l.Error().Err(err).Msg("Failed to list Parquet files")
-				r.Recorder.Event(table, corev1.EventTypeWarning, "ListParquetFilesFailed", err.Error())
-				return ctrl.Result{}, fmt.Errorf("failed to list Parquet files: %w", err)
-			}
+			metrics.RecordTableOperation("read", "succeeded")
 
-			// Record metrics
-			if latestJob.Labels["app.kubernetes.io/operation"] == string(duckdb.OperationTypeWrite) {
-				metrics.RecordTableOperation("write", "succeeded")
-			} else {
-				metrics.RecordTableOperation("read", "succeeded")
-			}
-
-			// Update status
-			if err := r.Status().Update(ctx, table); err != nil {
-				l.Error().Err(err).Msg("Failed to update status")
-				r.Recorder.Event(table, corev1.EventTypeWarning, "StatusUpdateFailed", err.Error())
-				return ctrl.Result{}, fmt.Errorf("failed to update status: %w", err)
-			}
-
-			// Get job logs for debugging
 			logs, err := r.Lifecycle.GetJobLogs(ctx, latestJob)
 			if err != nil {
 				l.Warn().Err(err).Msg("Failed to get job logs")
 			} else {
 				for podName, log := range logs {
-					l.Debug().
-						Str("pod", podName).
-						Str("logs", log).
-						Msg("Job pod logs")
+					l.Debug().Str("pod", podName).Str("logs", log).Msg("Job pod logs")
 				}
 			}
 
-			l.Info().
-				Int64("bytesWritten", table.Status.BytesWritten).
-				Time("lastModified", table.Status.LastModified.Time).
-				Msg("Table reconciliation completed successfully")
+			l.Info().Msg("Materialization completed successfully")
 
 			return ctrl.Result{}, nil
 		} else if state.Phase == duckdb.JobPhaseFailed {
@@ -534,6 +599,9 @@ func (r *DuckLakeTableReconciler) SetupWithManager(mgr ctrl.Manager) error {
 
 	// Store the config
 	r.Config = mgr.GetConfig()
+	if r.Materializer == nil {
+		r.Materializer = materializer.NewRunner()
+	}
 
 	// Initialize logger if not already set
 	if r.Logger == nil {
