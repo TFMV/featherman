@@ -233,6 +233,19 @@ The E2E tests require:
 - Controller image built and loaded
 - Proper RBAC and namespace configuration
 
+## featherman-query Service
+
+`featherman-query` exposes a simple HTTP endpoint for ad-hoc SQL queries using the warm pod pool.
+
+```bash
+curl -X POST http://localhost:8080/query \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"sql":"SELECT 1","format":"csv","catalog":"example"}'
+```
+
+Results stream back as CSV (default) or Arrow IPC.
+
 ## Monitoring
 
 The operator exposes Prometheus metrics for:
