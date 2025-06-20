@@ -110,6 +110,79 @@ type ParquetFormat struct {
 	Partitioning []string `json:"partitioning,omitempty"`
 }
 
+// MaterializationFormat defines the output format for materialization
+type MaterializationFormat struct {
+	// Type specifies the file format. Currently only "parquet" is supported
+	// +kubebuilder:validation:Enum=parquet
+	Type string `json:"type"`
+
+	// Compression specifies the compression algorithm
+	// +optional
+	// +kubebuilder:validation:Enum=ZSTD;SNAPPY
+	Compression CompressionType `json:"compression,omitempty"`
+
+	// PartitionBy specifies the partition columns
+	// +optional
+	PartitionBy []string `json:"partitionBy,omitempty"`
+}
+
+// MaterializationDestination defines the object store destination
+type MaterializationDestination struct {
+	// Bucket is the target bucket for the materialized dataset
+	// +kubebuilder:validation:Required
+	Bucket string `json:"bucket"`
+
+	// Prefix is the object prefix for the materialized files
+	// +optional
+	Prefix string `json:"prefix,omitempty"`
+}
+
+// MaterializeToSpec configures materialization of query results
+type MaterializeToSpec struct {
+	// Enabled determines whether materialization is active
+	// +kubebuilder:default=false
+	Enabled bool `json:"enabled"`
+
+	// Name is the logical name of the materialization
+	// +optional
+	Name string `json:"name,omitempty"`
+
+	// SQL is the query used to produce the dataset
+	// +optional
+	SQL string `json:"sql,omitempty"`
+
+	// Schedule is an optional cron expression for refresh
+	// +optional
+	Schedule string `json:"schedule,omitempty"`
+
+	// Format describes the output file format
+	// +optional
+	Format MaterializationFormat `json:"format,omitempty"`
+
+	// Destination specifies where the files are written
+	// +optional
+	Destination MaterializationDestination `json:"destination,omitempty"`
+}
+
+// MaterializationStatus tracks the outcome of a materialization run
+type MaterializationStatus struct {
+	// LastRun indicates the time of the last materialization
+	// +optional
+	LastRun *metav1.Time `json:"lastRun,omitempty"`
+
+	// Duration is the execution time of the last materialization
+	// +optional
+	Duration metav1.Duration `json:"duration,omitempty"`
+
+	// OutputPath is the object store prefix of the materialized files
+	// +optional
+	OutputPath string `json:"outputPath,omitempty"`
+
+	// RowCount is the number of rows produced in the last run
+	// +optional
+	RowCount int64 `json:"rowCount,omitempty"`
+}
+
 // DuckLakeTableSpec defines the desired state of DuckLakeTable
 type DuckLakeTableSpec struct {
 	// Name is the table name
@@ -153,6 +226,10 @@ type DuckLakeTableSpec struct {
 	// If not specified, the configuration from the referenced catalog will be used
 	// +optional
 	ObjectStore *ObjectStoreSpec `json:"objectStore,omitempty"`
+
+	// MaterializeTo configures optional view materialization
+	// +optional
+	MaterializeTo *MaterializeToSpec `json:"materializeTo,omitempty"`
 }
 
 // DuckLakeTableStatus defines the observed state of DuckLakeTable
@@ -180,6 +257,10 @@ type DuckLakeTableStatus struct {
 	// Conditions represent the latest available observations of the table's state
 	// +optional
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
+
+	// Materialization holds information about the last materialization run
+	// +optional
+	Materialization *MaterializationStatus `json:"materialization,omitempty"`
 }
 
 // +kubebuilder:object:root=true

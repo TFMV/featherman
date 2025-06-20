@@ -1,0 +1,26 @@
+apiVersion: ducklake.featherman.dev/v1alpha1
+kind: DuckLakeTable
+metadata:
+  name: top-users
+spec:
+  catalogRef: example
+  name: users
+  columns:
+  - name: id
+    type: INTEGER
+  - name: country
+    type: VARCHAR
+  format:
+    compression: ZSTD
+  location: users/
+  mode: append
+  materializeTo:
+    enabled: true
+    name: top_users
+    sql: "SELECT country, COUNT(*) AS cnt FROM users GROUP BY country"
+    destination:
+      bucket: exports
+      prefix: top_users/
+    format:
+      type: parquet
+      compression: ZSTD
