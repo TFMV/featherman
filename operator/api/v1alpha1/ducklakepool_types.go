@@ -36,6 +36,17 @@ type DuckLakePoolSpec struct {
 
 	// Metrics configures metrics exposure
 	Metrics MetricsConfig `json:"metrics,omitempty"`
+
+	// MaxQueryDuration limits how long a query may run
+	// +kubebuilder:default="60s"
+	MaxQueryDuration metav1.Duration `json:"maxQueryDuration,omitempty"`
+
+	// MaxRetries defines how many times to retry failed queries
+	// +kubebuilder:default=3
+	MaxRetries int32 `json:"maxRetries,omitempty"`
+
+	// Queue configures request queueing
+	Queue QueueConfig `json:"queue,omitempty"`
 }
 
 // PodTemplate defines the template for creating warm pods
@@ -119,6 +130,21 @@ type MetricsConfig struct {
 	// Port is the port to expose metrics on
 	// +kubebuilder:default=9090
 	Port int32 `json:"port,omitempty"`
+}
+
+// QueueConfig configures request queueing
+type QueueConfig struct {
+	// MaxLength is the maximum number of queued requests
+	// +kubebuilder:default=100
+	MaxLength int32 `json:"maxLength,omitempty"`
+
+	// MaxWaitTime is the maximum time a request may wait in the queue
+	// +kubebuilder:default="30s"
+	MaxWaitTime metav1.Duration `json:"maxWaitTime,omitempty"`
+
+	// Policy sets the queue policy (fifo or weighted)
+	// +kubebuilder:default="fifo"
+	Policy string `json:"policy,omitempty"`
 }
 
 // PodState represents the state of a warm pod

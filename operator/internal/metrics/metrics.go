@@ -39,6 +39,12 @@ var (
 	poolPodsDeleted   *prometheus.CounterVec
 	poolScalingEvents *prometheus.CounterVec
 
+	// Hardening metrics
+	poolQueryTimeoutTotal *prometheus.CounterVec
+	poolRetryTotal        *prometheus.CounterVec
+	poolQueueWaitDuration *prometheus.HistogramVec
+	poolCircuitOpenTotal  *prometheus.CounterVec
+
 	// Storage metrics
 	s3OperationTotal    *prometheus.CounterVec
 	s3OperationDuration *prometheus.HistogramVec
@@ -206,6 +212,40 @@ func InitMetrics(registry prometheus.Registerer) {
 			[]string{"pool_name", "namespace", "direction"},
 		)
 
+		// Hardening metrics
+		poolQueryTimeoutTotal = prometheus.NewCounterVec(
+			prometheus.CounterOpts{
+				Name: "ducklake_pool_query_timeout_total",
+				Help: "Count of queries terminated due to timeout",
+			},
+			[]string{"pool_name", "namespace"},
+		)
+
+		poolRetryTotal = prometheus.NewCounterVec(
+			prometheus.CounterOpts{
+				Name: "ducklake_pool_retry_total",
+				Help: "Count of automatic query retries",
+			},
+			[]string{"pool_name", "namespace"},
+		)
+
+		poolQueueWaitDuration = prometheus.NewHistogramVec(
+			prometheus.HistogramOpts{
+				Name:    "ducklake_pool_queue_wait_seconds",
+				Help:    "Histogram of time spent waiting in queue",
+				Buckets: prometheus.DefBuckets,
+			},
+			[]string{"pool_name", "namespace"},
+		)
+
+		poolCircuitOpenTotal = prometheus.NewCounterVec(
+			prometheus.CounterOpts{
+				Name: "ducklake_pool_circuit_open_total",
+				Help: "Circuit breaker activations per catalog/table",
+			},
+			[]string{"pool_name", "namespace"},
+		)
+
 		// Storage metrics
 		s3OperationTotal = prometheus.NewCounterVec(
 			prometheus.CounterOpts{
@@ -270,6 +310,10 @@ func InitMetrics(registry prometheus.Registerer) {
 			poolPodsCreated,
 			poolPodsDeleted,
 			poolScalingEvents,
+			poolQueryTimeoutTotal,
+			poolRetryTotal,
+			poolQueueWaitDuration,
+			poolCircuitOpenTotal,
 			s3OperationTotal,
 			s3OperationDuration,
 			catalogSize,
@@ -418,5 +462,33 @@ func RecordPodDeleted(poolName, namespace string) {
 func RecordScalingEvent(poolName, namespace, direction string) {
 	if poolScalingEvents != nil {
 		poolScalingEvents.WithLabelValues(poolName, namespace, direction).Inc()
+	}
+}
+
+// RecordQueryTimeout increments the query timeout counter
+func RecordQueryTimeout(poolName, namespace string) {
+	if poolQueryTimeoutTotal != nil {
+		poolQueryTimeoutTotal.WithLabelValues(poolName, namespace).Inc()
+	}
+}
+
+// RecordRetry increments the retry counter
+func RecordRetry(poolName, namespace string) {
+	if poolRetryTotal != nil {
+		poolRetryTotal.WithLabelValues(poolName, namespace).Inc()
+	}
+}
+
+// RecordQueueWaitDuration observes queue wait time
+func RecordQueueWaitDuration(poolName, namespace string, seconds float64) {
+	if poolQueueWaitDuration != nil {
+		poolQueueWaitDuration.WithLabelValues(poolName, namespace).Observe(seconds)
+	}
+}
+
+// RecordCircuitOpen increments circuit breaker counter
+func RecordCircuitOpen(poolName, namespace string) {
+	if poolCircuitOpenTotal != nil {
+		poolCircuitOpenTotal.WithLabelValues(poolName, namespace).Inc()
 	}
 }

@@ -15,11 +15,13 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	ducklakev1alpha1 "github.com/TFMV/featherman/operator/api/v1alpha1"
 	"github.com/TFMV/featherman/operator/internal/logger"
 	"github.com/TFMV/featherman/operator/internal/metrics"
+	"github.com/TFMV/featherman/operator/internal/retry"
 )
 
 // Request represents a request for a warm pod
@@ -41,6 +43,7 @@ type Response struct {
 type WarmPod struct {
 	Name       string
 	Namespace  string
+	PoolName   string
 	State      ducklakev1alpha1.PodState
 	LastUsed   time.Time
 	QueryCount int32
@@ -56,6 +59,34 @@ func (p *WarmPod) ExecuteQuery(ctx context.Context, sql string, timeout time.Dur
 	return executor.ExecuteQuery(ctx, p, sql, timeout)
 }
 
+// ExecuteQueryWithRetry executes a query with retries and records metrics
+func (p *WarmPod) ExecuteQueryWithRetry(ctx context.Context, sql string, timeout time.Duration, retries int, recorder record.EventRecorder) (string, error) {
+	var result string
+	attempt := 0
+	op := func(ctx context.Context) error {
+		attempt++
+		r, err := p.ExecuteQuery(ctx, sql, timeout)
+		if err != nil {
+			if ctx.Err() == context.DeadlineExceeded {
+				metrics.RecordQueryTimeout(p.PoolName, p.Namespace)
+				if recorder != nil {
+					poolRef := &ducklakev1alpha1.DuckLakePool{ObjectMeta: metav1.ObjectMeta{Name: p.PoolName, Namespace: p.Namespace}}
+					recorder.Eventf(poolRef, corev1.EventTypeWarning, "QueryTimeout", "query exceeded %s on pod %s", timeout.String(), p.Name)
+				}
+			}
+			if attempt <= retries {
+				metrics.RecordRetry(p.PoolName, p.Namespace)
+			}
+			return err
+		}
+		result = r
+		return nil
+	}
+	cfg := retry.DefaultRetryConfig.WithMaxRetries(retries)
+	err := retry.Do(ctx, op, cfg)
+	return result, err
+}
+
 // Manager manages a pool of warm DuckDB pods
 type Manager struct {
 	client    client.Client
@@ -65,10 +96,14 @@ type Manager struct {
 	namespace string
 	config    *rest.Config
 
-	mu           sync.RWMutex
-	pods         map[string]*WarmPod
-	requestQueue chan Request
-	stopCh       chan struct{}
+	mu               sync.RWMutex
+	pods             map[string]*WarmPod
+	requestQueue     chan Request
+	stopCh           chan struct{}
+	recorder         record.EventRecorder
+	maxQueryDuration time.Duration
+	maxRetries       int
+	queueTimeout     time.Duration
 }
 
 // NewManager creates a new pool manager
@@ -79,18 +114,49 @@ func NewManager(
 	pool *ducklakev1alpha1.DuckLakePool,
 	namespace string,
 	config *rest.Config,
+	recorder record.EventRecorder,
 ) *Manager {
-	return &Manager{
-		client:       client,
-		k8sClient:    k8sClient,
-		scheme:       scheme,
-		pool:         pool,
-		namespace:    namespace,
-		config:       config,
-		pods:         make(map[string]*WarmPod),
-		requestQueue: make(chan Request, 100),
-		stopCh:       make(chan struct{}),
+	queueLen := int(pool.Spec.Queue.MaxLength)
+	if queueLen <= 0 {
+		queueLen = 100
 	}
+	maxDur := pool.Spec.MaxQueryDuration.Duration
+	if maxDur <= 0 {
+		maxDur = 60 * time.Second
+	}
+	retries := int(pool.Spec.MaxRetries)
+	if retries <= 0 {
+		retries = 3
+	}
+	qTimeout := pool.Spec.Queue.MaxWaitTime.Duration
+	if qTimeout <= 0 {
+		qTimeout = 30 * time.Second
+	}
+	return &Manager{
+		client:           client,
+		k8sClient:        k8sClient,
+		scheme:           scheme,
+		pool:             pool,
+		namespace:        namespace,
+		config:           config,
+		pods:             make(map[string]*WarmPod),
+		requestQueue:     make(chan Request, queueLen),
+		stopCh:           make(chan struct{}),
+		recorder:         recorder,
+		maxQueryDuration: maxDur,
+		maxRetries:       retries,
+		queueTimeout:     qTimeout,
+	}
+}
+
+// GetMaxQueryDuration returns the configured maximum query duration
+func (m *Manager) GetMaxQueryDuration() time.Duration {
+	return m.maxQueryDuration
+}
+
+// GetMaxRetries returns the configured retry count
+func (m *Manager) GetMaxRetries() int {
+	return m.maxRetries
 }
 
 // Start starts the pool manager
@@ -678,6 +744,7 @@ func (m *Manager) createPod(ctx context.Context) (*WarmPod, error) {
 	warmPod := &WarmPod{
 		Name:       podName,
 		Namespace:  m.namespace,
+		PoolName:   m.pool.Name,
 		State:      ducklakev1alpha1.PodStateIdle,
 		LastUsed:   time.Now(),
 		QueryCount: 0,
