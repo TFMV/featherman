@@ -16,8 +16,6 @@ import (
 	"k8s.io/client-go/tools/remotecommand"
 
 	"github.com/TFMV/featherman/operator/internal/logger"
-	"github.com/TFMV/featherman/operator/internal/metrics"
-	"github.com/TFMV/featherman/operator/internal/retry"
 )
 
 // Executor executes SQL queries on warm pods
@@ -39,8 +37,7 @@ func NewExecutor(k8sClient kubernetes.Interface, config *rest.Config, logger *ze
 // ExecuteQuery executes a SQL query on a warm pod
 func (e *Executor) ExecuteQuery(ctx context.Context, pod *WarmPod, sql string, timeout time.Duration) (string, error) {
 	if e.logger == nil {
-		l := logger.FromContext(ctx)
-		e.logger = &l
+		e.logger = logger.FromContext(ctx)
 	}
 
 	startTime := time.Now()
